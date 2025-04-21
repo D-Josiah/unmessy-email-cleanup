@@ -1,4 +1,5 @@
 import { EmailValidationService } from '../../src/services/email-validator.js';
+import crypto from 'crypto';
 
 // Load configuration
 const config = {
@@ -13,7 +14,9 @@ const config = {
   },
   hubspot: {
     apiKey: process.env.HUBSPOT_API_KEY || '',
-  }
+    clientSecret: process.env.HUBSPOT_CLIENT_SECRET || '',
+  },
+  skipSignatureVerification: process.env.SKIP_SIGNATURE_VERIFICATION === 'true'
 };
 
 // Initialize the email validation service
@@ -26,6 +29,11 @@ export default async function handler(req, res) {
   }
   
   try {
+    // Verify HubSpot signature
+    if (!verifyHubspotSignature(req, config)) {
+      return res.status(401).json({ error: 'Invalid signature' });
+    }
+    
     // Respond immediately to prevent timeouts
     res.status(200).send('Processing');
     
@@ -36,7 +44,36 @@ export default async function handler(req, res) {
       
   } catch (error) {
     console.error('Error in webhook handler:', error);
-    // Already sent 200 response, so no need to respond again
+    // Already sent 200 response or failed verification, so no need to respond again
+  }
+}
+
+// Verify the HubSpot signature
+function verifyHubspotSignature(req, config) {
+  // Skip verification in development if configured
+  if (config.environment === 'development' && config.skipSignatureVerification) {
+    return true;
+  }
+  
+  try {
+    const signature = req.headers['x-hubspot-signature'];
+    const requestBody = JSON.stringify(req.body);
+    
+    if (!signature) {
+      console.error('Missing HubSpot signature');
+      return false;
+    }
+    
+    const hash = crypto
+      .createHmac('sha256', config.hubspot.clientSecret)
+      .update(requestBody)
+      .digest('hex');
+      
+    return hash === signature;
+    
+  } catch (error) {
+    console.error('Error verifying signature:', error);
+    return false;
   }
 }
 
