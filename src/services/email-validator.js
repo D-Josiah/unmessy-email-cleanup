@@ -699,18 +699,23 @@ export class EmailValidationService {
     return results;
   }
   
-  // Update HubSpot contact with timeout protection
+  // Update HubSpot contact with improved error handling and logging
   async updateHubSpotContact(contactId, validationResult) {
     console.log('HUBSPOT_UPDATE: Starting contact update', { 
       contactId, 
-      validationStatus: validationResult.status 
+      validationStatus: validationResult.status,
+      currentEmail: validationResult.currentEmail
     });
 
     try {
       // Validate HubSpot configuration
       if (!this.config.hubspot || !this.config.hubspot.apiKey) {
         console.error('HUBSPOT_UPDATE_ERROR: API key not configured');
-        throw new Error('HubSpot API key not configured');
+        return {
+          success: false,
+          contactId,
+          error: 'HubSpot API key not configured'
+        };
       }
       
       // Prepare properties to update
@@ -744,23 +749,41 @@ export class EmailValidationService {
 
       console.log('HUBSPOT_UPDATE: Sending update request', { 
         contactId, 
-        properties: Object.keys(properties) 
+        properties: Object.keys(properties),
+        requestBody: JSON.stringify({ properties })
       });
 
-      // Add strict timeout to HubSpot API call - 3 seconds max
+      // Add strict timeout to HubSpot API call - 8 seconds max for HubSpot
       const controller = new AbortController();
       const timeoutId = setTimeout(() => {
         console.log('HUBSPOT_UPDATE: Aborting request due to timeout');
         controller.abort();
-      }, 3000);
+      }, 8000);
       
       try {
+        // Log the full request details for debugging
+        console.log('HUBSPOT_UPDATE: Request details', {
+          url: `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}`,
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer [REDACTED]'
+          },
+          body: JSON.stringify({ properties })
+        });
+        
         // Send update request with abort signal
         const response = await fetch(
           `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}`,
           { ...fetchOptions, signal: controller.signal }
         );
         clearTimeout(timeoutId);
+        
+        // Log the response status for debugging
+        console.log('HUBSPOT_UPDATE: Response status', {
+          status: response.status,
+          statusText: response.statusText
+        });
         
         // Check response
         if (!response.ok) {
@@ -777,7 +800,8 @@ export class EmailValidationService {
         const data = await response.json();
         console.log('HUBSPOT_UPDATE: Update successful', { 
           contactId, 
-          responseId: data.id 
+          responseId: data.id,
+          responseData: JSON.stringify(data).substring(0, 200)
         });
         
         return {
@@ -793,7 +817,8 @@ export class EmailValidationService {
       console.error('HUBSPOT_UPDATE_FATAL_ERROR:', {
         contactId,
         message: error.message,
-        name: error.name
+        name: error.name,
+        stack: error.stack
       });
       
       // Special handling for AbortError (timeout)
