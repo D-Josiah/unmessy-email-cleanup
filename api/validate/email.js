@@ -1,317 +1,88 @@
 import { EmailValidationService } from '../../src/services/email-validator.js';
-import crypto from 'crypto';
 
+// Load configuration with Redis disabled by default to ensure reliability
 const config = {
-  environment: process.env.NODE_ENV || 'development',
   useZeroBounce: process.env.USE_ZERO_BOUNCE === 'true',
   zeroBounceApiKey: process.env.ZERO_BOUNCE_API_KEY || '',
   removeGmailAliases: true,
   checkAustralianTlds: true,
+  // Use Redis only when explicitly enabled by environment variable
+  useRedis: process.env.USE_REDIS === 'true',
   upstash: {
     url: process.env.UPSTASH_REDIS_URL || '',
     token: process.env.UPSTASH_REDIS_TOKEN || ''
-  },
-  hubspot: {
-    apiKey: process.env.HUBSPOT_API_KEY || '',
-    clientSecret: process.env.HUBSPOT_CLIENT_SECRET || ''
-  },
-  skipSignatureVerification: process.env.SKIP_SIGNATURE_VERIFICATION === 'true'
+  }
 };
 
-// Create a new instance for each request to prevent state bleeding between requests
-const createEmailValidator = () => new EmailValidationService(config);
+// Initialize the email validation service
+const emailValidator = new EmailValidationService(config);
 
 export default async function handler(req, res) {
-  console.log('Environment variables:', {
-    NODE_ENV: process.env.NODE_ENV,
-    SKIP_SIGNATURE_VERIFICATION: process.env.SKIP_SIGNATURE_VERIFICATION
-  });
-
-  // Log truncated payload to avoid excessive logging
-  const truncatedPayload = JSON.stringify(req.body).substring(0, 500);
-  console.log(`Received webhook payload (truncated): ${truncatedPayload}${truncatedPayload.length >= 500 ? '...' : ''}`);
-
+  // Only allow POST method
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
-
-  try {
-    if (!verifyHubspotSignature(req, config)) {
-      return res.status(401).json({ error: 'Invalid signature' });
-    }
-
-    // Send immediate response to avoid timeouts
-    res.status(202).json({ message: 'Processing webhook asynchronously' });
-
-    // Process webhooks asynchronously to avoid Vercel timeout
-    processWebhookAsync(req.body, config)
-      .then(result => console.log('Webhook processed successfully:', { 
-        success: result.success, 
-        eventCount: Array.isArray(result.processingResults) ? result.processingResults.length : 0 
-      }))
-      .catch(error => console.error('Error processing webhook:', error));
-
-  } catch (error) {
-    console.error('Error in webhook handler:', error);
-    // If response hasn't been sent yet, send an error
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'Internal server error' });
-    }
-  }
-}
-
-function verifyHubspotSignature(req, config) {
-  if (config.skipSignatureVerification) {
-    console.log('Skipping signature verification as configured');
-    return true;
-  }
-
-  try {
-    const signature = req.headers['x-hubspot-signature'];
-    const requestBody = JSON.stringify(req.body);
-
-    if (!signature) {
-      console.error('Missing HubSpot signature');
-      return false;
-    }
-
-    const hash = crypto
-      .createHmac('sha256', config.hubspot.clientSecret)
-      .update(requestBody)
-      .digest('hex');
-
-    return hash === signature;
-  } catch (error) {
-    console.error('Error verifying signature:', error);
-    return false;
-  }
-}
-
-async function processWebhookAsync(webhookData, config) {
-  try {
-    // Log truncated for large payloads
-    const truncatedData = JSON.stringify(webhookData).substring(0, 200);
-    console.log(`Processing webhook data (truncated): ${truncatedData}${truncatedData.length >= 200 ? '...' : ''}`);
-
-    if (Array.isArray(webhookData)) {
-      console.log(`Webhook contains an array of ${webhookData.length} events, processing each one`);
-
-      const results = [];
-      for (const event of webhookData) {
-        try {
-          // Set a timeout for each event to prevent hanging
-          const timeoutPromise = new Promise((_, reject) => {
-            setTimeout(() => reject(new Error('Event processing timeout')), 8000);
-          });
-
-          const result = await Promise.race([
-            processWebhookEvent(event, config),
-            timeoutPromise
-          ]).catch(error => {
-            console.error(`Event processing error or timeout: ${error.message}`);
-            return { 
-              success: false, 
-              error: error.message, 
-              contactId: event.objectId || 'unknown'
-            };
-          });
-          
-          results.push(result);
-        } catch (error) {
-          console.error(`Error processing event: ${error.message}`);
-          results.push({ 
-            success: false, 
-            error: error.message, 
-            contactId: event.objectId || 'unknown'
-          });
-        }
-      }
-
-      return {
-        success: true,
-        processingResults: results
-      };
-    } else {
-      return await processWebhookEvent(webhookData, config);
-    }
-  } catch (error) {
-    console.error('Error processing webhook:', error);
-    return {
-      success: false,
-      error: error.message
-    };
-  }
-}
-
-async function processWebhookEvent(event, config) {
-  // Create a new validator instance for each event
-  const emailValidator = createEmailValidator();
   
   try {
-    const contactId = event.objectId;
-    let email = null;
-
-    if (event.propertyName === 'email' && event.propertyValue) {
-      email = event.propertyValue;
-    } else if (event.properties?.email) {
-      email = event.properties.email.value || event.properties.email;
-    } else if (event.email) {
-      email = event.email;
-    }
-
-    const subscriptionType = event.subscriptionType || 'contact.propertyChange';
-
-    console.log('Extracted from webhook event:', { contactId, email, subscriptionType });
-
+    const { email } = req.body;
+    
     if (!email) {
-      console.log(`No email found for contact ${contactId}, skipping validation`);
-      return { success: false, reason: 'no_email', contactId };
+      return res.status(400).json({ error: 'Email is required' });
     }
-
-    const shouldValidate = shouldValidateForSubscriptionType(subscriptionType);
-
-    if (!shouldValidate) {
-      console.log(`Skipping validation for subscription type: ${subscriptionType}`);
-      return { success: false, reason: 'subscription_type_skipped', contactId, subscriptionType };
-    }
-
-    console.log(`Starting email validation for: ${email}`);
-    console.log('Step 1: Initializing validation');
-
-    console.log('Redis configuration:', {
-      url: config.upstash.url ? 'CONFIGURED' : 'MISSING',
-      token: config.upstash.token ? 'CONFIGURED' : 'MISSING'
+    
+    // Log for debugging
+    console.log('Processing email validation for:', email);
+    
+    // CRITICAL: Set a strict global timeout to ensure we respond before Vercel's timeout
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => {
+        reject(new Error('Function timeout to prevent Vercel runtime timeout'));
+      }, 5000); // Set to 5 seconds (half of Vercel's 10-second limit)
     });
-
-    console.log('Step 2: Checking email format');
-    const formatValid = emailValidator.isValidEmailFormat(email);
-    console.log('Format check result:', formatValid);
-
-    console.log('Step 3: Correcting typos');
-    const typoResult = emailValidator.correctEmailTypos(email);
-    console.log('Typo correction result:', typoResult);
-
-    // Fall back to faster validation if we're likely to time out
-    const useSimplifiedValidation = !config.upstash.url || !config.upstash.token;
     
-    let validationResult;
-    
-    if (useSimplifiedValidation) {
-      console.log('Using simplified validation (Redis not configured)');
-      // Create a simplified validation result based on local checks only
-      validationResult = {
+    // First do a quick format check - if invalid, return immediately
+    if (!emailValidator.isValidEmailFormat(email)) {
+      console.log('Quick validation: Invalid email format');
+      return res.status(200).json({
         originalEmail: email,
-        currentEmail: typoResult.email,
-        formatValid: formatValid,
-        wasCorrected: typoResult.corrected,
-        isKnownValid: false,
-        domainValid: emailValidator.isValidDomain(typoResult.email),
-        status: formatValid ? (emailValidator.isValidDomain(typoResult.email) ? 'unknown' : 'invalid') : 'invalid',
-        subStatus: formatValid ? null : 'bad_format',
-        recheckNeeded: formatValid && emailValidator.isValidDomain(typoResult.email),
-        validationSteps: [
-          { step: 'format_check', passed: formatValid },
-          { 
-            step: 'typo_correction', 
-            applied: typoResult.corrected, 
-            original: email, 
-            corrected: typoResult.email 
-          },
-          { step: 'domain_check', passed: emailValidator.isValidDomain(typoResult.email) }
-        ]
-      };
-    } else {
-      console.log('Step 4: Proceeding with full validation');
-      // Set a timeout for the validation to ensure we don't hang
-      const validationPromise = emailValidator.validateEmail(email);
-      const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error('Validation timeout')), 5000);
+        currentEmail: email,
+        formatValid: false,
+        status: 'invalid',
+        subStatus: 'bad_format',
+        recheckNeeded: false
       });
-      
-      try {
-        validationResult = await Promise.race([validationPromise, timeoutPromise]);
-      } catch (error) {
-        console.error(`Validation error or timeout: ${error.message}`);
-        // Create a fallback validation result if validation fails
-        validationResult = {
-          originalEmail: email,
-          currentEmail: typoResult.email,
-          formatValid: formatValid,
-          wasCorrected: typoResult.corrected,
-          isKnownValid: false,
-          domainValid: emailValidator.isValidDomain(typoResult.email),
-          status: 'check_failed',
-          recheckNeeded: true,
-          error: error.message,
-          validationSteps: [
-            { step: 'format_check', passed: formatValid },
-            { 
-              step: 'typo_correction', 
-              applied: typoResult.corrected, 
-              original: email, 
-              corrected: typoResult.email 
-            },
-            { step: 'domain_check', passed: emailValidator.isValidDomain(typoResult.email) }
-          ]
-        };
-      }
     }
     
-    console.log('Email validation completed:', {
-      status: validationResult.status,
-      wasCorrected: validationResult.wasCorrected,
-      correctedEmail: validationResult.currentEmail
-    });
-
-    console.log(`Updating HubSpot contact ${contactId} with validation results`);
-    console.log('HubSpot configuration:', {
-      apiKey: config.hubspot.apiKey ? 'CONFIGURED' : 'MISSING'
-    });
-
-    // Set a timeout for the HubSpot update
-    const updatePromise = emailValidator.updateHubSpotContact(contactId, validationResult);
-    const updateTimeoutPromise = new Promise((_, reject) => {
-      setTimeout(() => reject(new Error('HubSpot update timeout')), 3000);
-    });
+    // Try to correct typos first
+    const { corrected, email: correctedEmail } = emailValidator.correctEmailTypos(email);
+    console.log('Typo correction result:', { corrected, correctedEmail });
     
-    let updateResult;
+    // Get quick validation result as a fallback
+    const quickResult = emailValidator.quickValidate(email);
+    
     try {
-      updateResult = await Promise.race([updatePromise, updateTimeoutPromise]);
+      // Race between validation and timeout, with 5 seconds max
+      const result = await Promise.race([
+        emailValidator.validateEmail(email, { 
+          skipZeroBounce: false, 
+          timeoutMs: 4000 // Even stricter timeout for the validation itself
+        }),
+        timeoutPromise
+      ]);
+      
+      return res.status(200).json(result);
     } catch (error) {
-      console.error(`HubSpot update error or timeout: ${error.message}`);
-      updateResult = {
-        success: false,
-        contactId,
-        error: error.message
-      };
+      console.error('Email validation timed out or failed:', error);
+      
+      // Return the quick result if we hit our safety timeout
+      console.log('Falling back to quick validation result');
+      return res.status(200).json(quickResult);
     }
-    
-    console.log('HubSpot contact update completed:', {
-      success: updateResult.success,
-      contactId
-    });
-
-    return {
-      success: true,
-      contactId,
-      validationResult,
-      updateResult
-    };
   } catch (error) {
-    console.error('Error processing webhook event:', error);
-    return {
-      success: false,
-      error: error.message,
-      contactId: event.objectId || 'unknown'
-    };
+    console.error('Fatal error validating email:', error);
+    return res.status(500).json({
+      error: 'Error validating email',
+      details: error.message
+    });
   }
-}
-
-function shouldValidateForSubscriptionType(subscriptionType) {
-  const validSubscriptionTypes = [
-    'contact.creation',
-    'contact.propertyChange',
-    'contact.merge'
-  ];
-  return validSubscriptionTypes.includes(subscriptionType);
 }

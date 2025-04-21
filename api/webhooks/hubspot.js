@@ -7,18 +7,20 @@ const config = {
   zeroBounceApiKey: process.env.ZERO_BOUNCE_API_KEY || '',
   removeGmailAliases: true,
   checkAustralianTlds: true,
+  useRedis: process.env.USE_REDIS === 'true',
   upstash: {
     url: process.env.UPSTASH_REDIS_URL || '',
     token: process.env.UPSTASH_REDIS_TOKEN || ''
   },
   hubspot: {
     apiKey: process.env.HUBSPOT_API_KEY || '',
-    clientSecret: process.env.HUBSPOT_CLIENT_SECRET || '',
+    clientSecret: process.env.HUBSPOT_CLIENT_SECRET || ''
   },
   skipSignatureVerification: process.env.SKIP_SIGNATURE_VERIFICATION === 'true'
 };
 
-const emailValidator = new EmailValidationService(config);
+// Create a new instance for each request to prevent state bleeding between requests
+const createEmailValidator = () => new EmailValidationService(config);
 
 export default async function handler(req, res) {
   console.log('Environment variables:', {
@@ -26,7 +28,9 @@ export default async function handler(req, res) {
     SKIP_SIGNATURE_VERIFICATION: process.env.SKIP_SIGNATURE_VERIFICATION
   });
 
-  console.log('Received webhook payload:', JSON.stringify(req.body, null, 2));
+  // Log truncated payload to avoid excessive logging
+  const truncatedPayload = JSON.stringify(req.body).substring(0, 500);
+  console.log(`Received webhook payload (truncated): ${truncatedPayload}${truncatedPayload.length >= 500 ? '...' : ''}`);
 
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
@@ -37,14 +41,23 @@ export default async function handler(req, res) {
       return res.status(401).json({ error: 'Invalid signature' });
     }
 
-    res.status(200).send('Processing');
+    // Send immediate response to avoid timeouts
+    res.status(202).json({ message: 'Processing webhook asynchronously' });
 
-    processWebhook(req.body, config)
-      .then(result => console.log('Webhook processed:', result))
+    // Process webhooks asynchronously to avoid Vercel timeout
+    processWebhookAsync(req.body, config)
+      .then(result => console.log('Webhook processed successfully:', { 
+        success: result.success, 
+        eventCount: Array.isArray(result.processingResults) ? result.processingResults.length : 0 
+      }))
       .catch(error => console.error('Error processing webhook:', error));
 
   } catch (error) {
     console.error('Error in webhook handler:', error);
+    // If response hasn't been sent yet, send an error
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Internal server error' });
+    }
   }
 }
 
@@ -75,17 +88,44 @@ function verifyHubspotSignature(req, config) {
   }
 }
 
-async function processWebhook(webhookData, config) {
+async function processWebhookAsync(webhookData, config) {
   try {
-    console.log('Processing webhook data:', JSON.stringify(webhookData, null, 2));
+    // Log truncated for large payloads
+    const truncatedData = JSON.stringify(webhookData).substring(0, 200);
+    console.log(`Processing webhook data (truncated): ${truncatedData}${truncatedData.length >= 200 ? '...' : ''}`);
 
     if (Array.isArray(webhookData)) {
-      console.log('Webhook contains an array of events, processing each one');
+      console.log(`Webhook contains an array of ${webhookData.length} events, processing each one`);
 
       const results = [];
       for (const event of webhookData) {
-        const result = await processWebhookEvent(event, config);
-        results.push(result);
+        try {
+          // Set a timeout for each event to prevent hanging
+          const timeoutPromise = new Promise((_, reject) => {
+            setTimeout(() => reject(new Error('Event processing timeout')), 8000);
+          });
+
+          const result = await Promise.race([
+            processWebhookEvent(event, config),
+            timeoutPromise
+          ]).catch(error => {
+            console.error(`Event processing error or timeout: ${error.message}`);
+            return { 
+              success: false, 
+              error: error.message, 
+              contactId: event.objectId || 'unknown'
+            };
+          });
+          
+          results.push(result);
+        } catch (error) {
+          console.error(`Error processing event: ${error.message}`);
+          results.push({ 
+            success: false, 
+            error: error.message, 
+            contactId: event.objectId || 'unknown'
+          });
+        }
       }
 
       return {
@@ -105,6 +145,9 @@ async function processWebhook(webhookData, config) {
 }
 
 async function processWebhookEvent(event, config) {
+  // Create a new validator instance for each event
+  const emailValidator = createEmailValidator();
+  
   try {
     const contactId = event.objectId;
     let email = null;
@@ -134,32 +177,60 @@ async function processWebhookEvent(event, config) {
     }
 
     console.log(`Starting email validation for: ${email}`);
-    console.log('Step 1: Initializing validation');
-
-    console.log('Redis configuration:', {
-      url: config.upstash.url ? 'CONFIGURED' : 'MISSING',
-      token: config.upstash.token ? 'CONFIGURED' : 'MISSING'
+    
+    // Get quick validation result first as a fallback
+    const quickResult = emailValidator.quickValidate(email);
+    
+    let validationResult;
+    
+    // Try full validation with timeout
+    try {
+      const validationPromise = emailValidator.validateEmail(email, {
+        skipZeroBounce: false,
+        timeoutMs: 3000
+      });
+      
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('Validation timeout')), 4000);
+      });
+      
+      validationResult = await Promise.race([validationPromise, timeoutPromise]);
+    } catch (error) {
+      console.error(`Validation error or timeout: ${error.message}`);
+      // Use quick result as fallback
+      validationResult = quickResult;
+    }
+    
+    console.log('Email validation completed:', {
+      status: validationResult.status,
+      wasCorrected: validationResult.wasCorrected,
+      correctedEmail: validationResult.currentEmail
     });
-
-    console.log('Step 2: Checking email format');
-    const formatValid = emailValidator.isValidEmailFormat(email);
-    console.log('Format check result:', formatValid);
-
-    console.log('Step 3: Correcting typos');
-    const typoResult = emailValidator.correctEmailTypos(email);
-    console.log('Typo correction result:', typoResult);
-
-    console.log('Step 4: Proceeding with full validation');
-    const validationResult = await emailValidator.validateEmail(email);
-    console.log('Email validation completed:', validationResult);
 
     console.log(`Updating HubSpot contact ${contactId} with validation results`);
-    console.log('HubSpot configuration:', {
-      apiKey: config.hubspot.apiKey ? 'CONFIGURED' : 'MISSING'
+    
+    let updateResult;
+    try {
+      // Set a timeout for the HubSpot update
+      const updatePromise = emailValidator.updateHubSpotContact(contactId, validationResult);
+      const updateTimeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('HubSpot update timeout')), 3000);
+      });
+      
+      updateResult = await Promise.race([updatePromise, updateTimeoutPromise]);
+    } catch (error) {
+      console.error(`HubSpot update error or timeout: ${error.message}`);
+      updateResult = {
+        success: false,
+        contactId,
+        error: error.message
+      };
+    }
+    
+    console.log('HubSpot contact update completed:', {
+      success: updateResult.success,
+      contactId
     });
-
-    const updateResult = await emailValidator.updateHubSpotContact(contactId, validationResult);
-    console.log('HubSpot contact update completed:', updateResult);
 
     return {
       success: true,
@@ -171,7 +242,8 @@ async function processWebhookEvent(event, config) {
     console.error('Error processing webhook event:', error);
     return {
       success: false,
-      error: error.message
+      error: error.message,
+      contactId: event.objectId || 'unknown'
     };
   }
 }
