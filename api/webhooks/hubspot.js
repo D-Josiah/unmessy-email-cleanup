@@ -1,7 +1,6 @@
 import { EmailValidationService } from '../../src/services/email-validator.js';
 import crypto from 'crypto';
 
-// Load configuration
 const config = {
   environment: process.env.NODE_ENV || 'development',
   useZeroBounce: process.env.USE_ZERO_BOUNCE === 'true',
@@ -19,7 +18,6 @@ const config = {
   skipSignatureVerification: process.env.SKIP_SIGNATURE_VERIFICATION === 'true'
 };
 
-// Initialize the email validation service
 const emailValidator = new EmailValidationService(config);
 
 export default async function handler(req, res) {
@@ -27,13 +25,13 @@ export default async function handler(req, res) {
     NODE_ENV: process.env.NODE_ENV,
     SKIP_SIGNATURE_VERIFICATION: process.env.SKIP_SIGNATURE_VERIFICATION
   });
-  
+
   console.log('Received webhook payload:', JSON.stringify(req.body, null, 2));
-  
+
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
-  
+
   try {
     if (!verifyHubspotSignature(req, config)) {
       return res.status(401).json({ error: 'Invalid signature' });
@@ -44,7 +42,7 @@ export default async function handler(req, res) {
     processWebhook(req.body, config)
       .then(result => console.log('Webhook processed:', result))
       .catch(error => console.error('Error processing webhook:', error));
-      
+
   } catch (error) {
     console.error('Error in webhook handler:', error);
   }
@@ -106,16 +104,6 @@ async function processWebhook(webhookData, config) {
   }
 }
 
-// Timeout wrapper for Redis ping
-const pingWithTimeout = async (client, ms = 3000) => {
-  return Promise.race([
-    client.ping(),
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('Redis ping timeout')), ms)
-    )
-  ]);
-};
-
 async function processWebhookEvent(event, config) {
   try {
     const contactId = event.objectId;
@@ -152,15 +140,6 @@ async function processWebhookEvent(event, config) {
       url: config.upstash.url ? 'CONFIGURED' : 'MISSING',
       token: config.upstash.token ? 'CONFIGURED' : 'MISSING'
     });
-
-    try {
-      console.log('Testing Redis connection...');
-      await pingWithTimeout(emailValidator.redis);
-      console.log('Redis connection successful');
-    } catch (redisError) {
-      console.error('Redis connection failed or timed out:', redisError);
-      throw new Error(`Redis connection error: ${redisError.message}`);
-    }
 
     console.log('Step 2: Checking email format');
     const formatValid = emailValidator.isValidEmailFormat(email);
