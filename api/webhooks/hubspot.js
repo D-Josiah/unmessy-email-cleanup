@@ -167,11 +167,42 @@ async function processWebhookEvent(event, config) {
       };
     }
 
-    // Validate the email
-    const validationResult = await emailValidator.validateEmail(email);
+    // Added detailed logging before validation
+    console.log(`Starting email validation for: ${email}`);
+    
+    // Validate the email with better error handling
+    let validationResult;
+    try {
+      validationResult = await emailValidator.validateEmail(email);
+      console.log('Email validation completed:', validationResult);
+    } catch (validationError) {
+      console.error('Error during email validation:', validationError);
+      return {
+        success: false,
+        error: `Email validation failed: ${validationError.message}`,
+        contactId,
+        email
+      };
+    }
 
-    // Update the contact in HubSpot with the validation results
-    const updateResult = await emailValidator.updateHubSpotContact(contactId, validationResult);
+    // Added detailed logging before HubSpot update
+    console.log(`Updating HubSpot contact ${contactId} with validation results`);
+    
+    // Update the contact in HubSpot with better error handling
+    let updateResult;
+    try {
+      updateResult = await emailValidator.updateHubSpotContact(contactId, validationResult);
+      console.log('HubSpot contact update completed:', updateResult);
+    } catch (updateError) {
+      console.error('Error updating HubSpot contact:', updateError);
+      return {
+        success: false,
+        error: `HubSpot update failed: ${updateError.message}`,
+        contactId,
+        email,
+        validationResult
+      };
+    }
 
     return {
       success: true,
