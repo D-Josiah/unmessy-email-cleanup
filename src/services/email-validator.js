@@ -28,41 +28,71 @@ export class EmailValidationService {
     this.australianTlds = ['.com.au', '.net.au', '.org.au', '.edu.au', '.gov.au', '.asn.au', '.id.au', '.au'];
     this.commonValidDomains = ['gmail.com', 'outlook.com', 'hotmail.com', 'yahoo.com', 'icloud.com', 'aol.com'];
   }
+
+  // Utility method for adding timeout to promises
+  async withTimeout(promise, timeoutMs = 3000, errorMessage = 'Operation timeout') {
+    const timeout = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(errorMessage)), timeoutMs)
+    );
+    
+    return Promise.race([promise, timeout]);
+  }
   
-  // Add email to Redis store
+  // Add email to Redis store with improved timeout protection
   async addToKnownValidEmails(email) {
+    const key = `email:${email}`;
+    const data = {
+      validatedAt: new Date().toISOString(),
+      source: 'validation-service'
+    };
+    
     try {
-      const key = `email:${email}`;
-      const data = {
-        validatedAt: new Date().toISOString(),
-        source: 'validation-service'
-      };
-      
-      // Store in Redis with 30 day expiration (in seconds)
-      await this.redis.set(key, JSON.stringify(data), { ex: 30 * 24 * 60 * 60 });
-      
+      await this.withTimeout(
+        this.redis.set(key, JSON.stringify(data), { ex: 30 * 24 * 60 * 60 }),
+        3000,
+        'Redis SET timeout'
+      );
       return true;
     } catch (error) {
-      console.error('Error storing email in Redis:', error);
+      console.error('Error storing email in Redis:', error.message);
+      
+      // More granular error logging
+      if (error.message === 'Redis SET timeout') {
+        console.warn(`Redis SET operation timed out for email: ${email}`);
+      }
+      
       return false;
     }
   }
   
-  // Check if email exists in Redis store
+  // Check if email exists in Redis store with improved timeout protection
   async isKnownValidEmail(email) {
+    const key = `email:${email}`;
+    
     try {
-      const key = `email:${email}`;
-      const result = await this.redis.get(key);
+      const result = await this.withTimeout(
+        this.redis.get(key),
+        3000,
+        'Redis GET timeout'
+      );
+      
       return !!result;
     } catch (error) {
-      console.error('Error checking Redis for email:', error);
+      console.error('Error checking Redis for email:', error.message);
+      
+      // More granular error logging
+      if (error.message === 'Redis GET timeout') {
+        console.warn(`Redis GET operation timed out for email: ${email}`);
+      }
+      
       return false;
     }
   }
   
-  // Basic email format check with regex
+  // Basic email format check with improved regex
   isValidEmailFormat(email) {
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    // More comprehensive email validation regex
+    const emailRegex = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
     return emailRegex.test(email);
   }
   
@@ -112,17 +142,28 @@ export class EmailValidationService {
     return { corrected, email: cleanedEmail };
   }
   
-  // Check if email domain is valid
+  // Check if email domain is valid with expanded list
   isValidDomain(email) {
     try {
       const domain = email.split('@')[1];
-      return this.commonValidDomains.includes(domain);
+      
+      // Expanded list of valid domains
+      const extendedValidDomains = [
+        ...this.commonValidDomains,
+        'protonmail.com', 
+        'zoho.com', 
+        'fastmail.com', 
+        'pm.me', 
+        'googlemail.com'
+      ];
+      
+      return extendedValidDomains.includes(domain);
     } catch (error) {
       return false;
     }
   }
   
-  // Check email with ZeroBounce API
+  // Check email with ZeroBounce API (rest of the method remains the same)
   async checkWithZeroBounce(email) {
     try {
       const url = new URL('https://api.zerobounce.net/v2/validate');
