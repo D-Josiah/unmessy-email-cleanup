@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "regions": ["syd1"],  // This will deploy your functions to the Sydney region
+  "regions": ["syd1"], 
   "builds": [
     { 
       "src": "api/**/*.js", 
