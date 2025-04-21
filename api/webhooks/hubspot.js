@@ -1,13 +1,15 @@
 import { EmailValidationService } from '../../src/services/email-validator.js';
 import crypto from 'crypto';
 
+// Load configuration keeping Redis and ZeroBounce enabled by default
 const config = {
   environment: process.env.NODE_ENV || 'development',
-  useZeroBounce: process.env.USE_ZERO_BOUNCE === 'true',
+  useZeroBounce: process.env.USE_ZERO_BOUNCE !== 'false', // Enabled by default
   zeroBounceApiKey: process.env.ZERO_BOUNCE_API_KEY || '',
   removeGmailAliases: true,
   checkAustralianTlds: true,
-  useRedis: process.env.USE_REDIS === 'true',
+  // Keep Redis enabled by default, only disable if explicitly set to 'false'
+  useRedis: process.env.USE_REDIS !== 'false',
   upstash: {
     url: process.env.UPSTASH_REDIS_URL || '',
     token: process.env.UPSTASH_REDIS_TOKEN || ''
@@ -16,7 +18,15 @@ const config = {
     apiKey: process.env.HUBSPOT_API_KEY || '',
     clientSecret: process.env.HUBSPOT_CLIENT_SECRET || ''
   },
-  skipSignatureVerification: process.env.SKIP_SIGNATURE_VERIFICATION === 'true'
+  skipSignatureVerification: process.env.SKIP_SIGNATURE_VERIFICATION === 'true',
+  // Configure timeout values
+  timeouts: {
+    redis: 2000,         // Redis operations timeout in ms
+    zeroBounce: 4000,    // ZeroBounce API timeout in ms
+    hubspot: 8000,       // HubSpot API timeout in ms
+    validation: 6000,    // Total validation timeout in ms
+    webhook: 8000        // Webhook processing timeout in ms
+  }
 };
 
 // Create a new instance for each request to prevent state bleeding between requests
@@ -25,7 +35,9 @@ const createEmailValidator = () => new EmailValidationService(config);
 export default async function handler(req, res) {
   console.log('Environment variables:', {
     NODE_ENV: process.env.NODE_ENV,
-    SKIP_SIGNATURE_VERIFICATION: process.env.SKIP_SIGNATURE_VERIFICATION
+    SKIP_SIGNATURE_VERIFICATION: process.env.SKIP_SIGNATURE_VERIFICATION,
+    USE_REDIS: process.env.USE_REDIS,
+    USE_ZERO_BOUNCE: process.env.USE_ZERO_BOUNCE
   });
 
   // Log truncated payload to avoid excessive logging
@@ -102,7 +114,7 @@ async function processWebhookAsync(webhookData, config) {
         try {
           // Set a timeout for each event to prevent hanging
           const timeoutPromise = new Promise((_, reject) => {
-            setTimeout(() => reject(new Error('Event processing timeout')), 8000);
+            setTimeout(() => reject(new Error('Event processing timeout')), config.timeouts.webhook);
           });
 
           const result = await Promise.race([
@@ -187,11 +199,11 @@ async function processWebhookEvent(event, config) {
     try {
       const validationPromise = emailValidator.validateEmail(email, {
         skipZeroBounce: false,
-        timeoutMs: 3000
+        timeoutMs: config.timeouts.validation
       });
       
       const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error('Validation timeout')), 4000);
+        setTimeout(() => reject(new Error('Validation timeout')), config.timeouts.validation + 1000);
       });
       
       validationResult = await Promise.race([validationPromise, timeoutPromise]);
@@ -214,7 +226,7 @@ async function processWebhookEvent(event, config) {
       // Set a timeout for the HubSpot update
       const updatePromise = emailValidator.updateHubSpotContact(contactId, validationResult);
       const updateTimeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error('HubSpot update timeout')), 3000);
+        setTimeout(() => reject(new Error('HubSpot update timeout')), config.timeouts.hubspot + 1000);
       });
       
       updateResult = await Promise.race([updatePromise, updateTimeoutPromise]);

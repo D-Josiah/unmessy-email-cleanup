@@ -4,17 +4,26 @@ export class EmailValidationService {
   constructor(config) {
     this.config = config;
     
-    // Initialize Redis only if explicitly enabled
+    // Initialize Redis by default unless explicitly disabled
     this.redis = null;
     this.redisEnabled = !!(config.upstash && 
-                          config.upstash.url && 
-                          config.upstash.token &&
-                          config.useRedis !== false);
+                           config.upstash.url && 
+                           config.upstash.token &&
+                           config.useRedis !== false);
+    
+    // Timeouts configuration with defaults
+    this.timeouts = {
+      redis: config.timeouts?.redis || 2000,
+      zeroBounce: config.timeouts?.zeroBounce || 4000,
+      hubspot: config.timeouts?.hubspot || 8000,
+      validation: config.timeouts?.validation || 6000,
+      webhook: config.timeouts?.webhook || 8000
+    };
 
-    // Only initialize Redis if explicitly enabled
+    // Initialize Redis if enabled
     if (this.redisEnabled) {
       try {
-        console.log('UPSTASH_INIT: Attempting to initialize Redis client', {
+        console.log('UPSTASH_INIT: Initializing Redis client', {
           url: config.upstash.url ? 'URL PROVIDED' : 'NO URL',
           tokenProvided: !!config.upstash.token
         });
@@ -24,23 +33,20 @@ export class EmailValidationService {
           token: config.upstash.token,
         });
 
-        // Test connection but don't block initialization
+        // Test connection but don't block initialization and don't disable Redis if test fails
         this.testRedisConnection().catch(err => {
           console.error('Redis connection test failed:', err.message);
-          // Disable Redis if connection test fails
-          this.redis = null;
-          this.redisEnabled = false;
+          // Don't disable Redis, just log the error
         });
       } catch (error) {
-        console.error('UPSTASH_INIT_FATAL_ERROR:', {
+        console.error('UPSTASH_INIT_ERROR:', {
           message: error.message,
           stack: error.stack
         });
-        this.redis = null;
-        this.redisEnabled = false;
+        // Still keep Redis enabled for future attempts
       }
     } else {
-      console.log('UPSTASH_INIT: Redis disabled by configuration');
+      console.log('UPSTASH_INIT: Redis not configured');
     }
     
     // Common email domain typos
@@ -85,7 +91,7 @@ export class EmailValidationService {
     ];
   }
 
-  // Connection test method with short timeout
+  // Connection test method with configured timeout
   async testRedisConnection() {
     if (!this.redis) {
       console.error('UPSTASH_CONNECTION_TEST: Redis client not initialized');
@@ -96,7 +102,7 @@ export class EmailValidationService {
       console.log('UPSTASH_CONNECTION_TEST: Attempting ping');
       const pingResult = await this.withTimeout(
         this.redis.ping(),
-        1000,
+        this.timeouts.redis,
         'Redis ping timeout'
       );
       console.log('UPSTASH_CONNECTION_TEST: Ping successful', { result: pingResult });
@@ -111,8 +117,8 @@ export class EmailValidationService {
     }
   }
 
-  // Ultra-short timeout wrapper method
-  async withTimeout(promise, timeoutMs = 1000, errorMessage = 'Operation timeout') {
+  // Timeout wrapper method with configurable timeout
+  async withTimeout(promise, timeoutMs, errorMessage = 'Operation timeout') {
     console.log('TIMEOUT_WRAPPER: Initiating timeout-protected operation', {
       timeoutMs,
       errorMessage
@@ -139,10 +145,10 @@ export class EmailValidationService {
     }
   }
   
-  // Add email to Redis store - Skip if Redis disabled
+  // Add email to Redis store - Skip if Redis operation fails but don't disable Redis
   async addToKnownValidEmails(email) {
     if (!this.redisEnabled || !this.redis) {
-      console.log('REDIS_ADD: Redis disabled, skipping operation');
+      console.log('REDIS_ADD: Redis not available, skipping operation');
       return false;
     }
 
@@ -161,7 +167,7 @@ export class EmailValidationService {
 
       const setResult = await this.withTimeout(
         this.redis.set(key, JSON.stringify(data), { ex: 30 * 24 * 60 * 60 }),
-        1000,
+        this.timeouts.redis,
         'Redis SET timeout'
       );
       
@@ -179,14 +185,15 @@ export class EmailValidationService {
         stack: error.stack
       });
       
+      // Skip this operation but keep Redis enabled
       return false;
     }
   }
   
-  // Check if email exists in Redis store - Skip if Redis disabled
+  // Check if email exists in Redis store - Skip if operation fails but don't disable Redis
   async isKnownValidEmail(email) {
     if (!this.redisEnabled || !this.redis) {
-      console.log('REDIS_GET: Redis disabled, skipping check');
+      console.log('REDIS_GET: Redis not available, skipping check');
       return false;
     }
 
@@ -197,7 +204,7 @@ export class EmailValidationService {
 
       const result = await this.withTimeout(
         this.redis.get(key),
-        1000,
+        this.timeouts.redis,
         'Redis GET timeout'
       );
       
@@ -217,7 +224,7 @@ export class EmailValidationService {
         stack: error.stack
       });
       
-      // Continue with other validation steps if Redis fails
+      // Continue with other validation steps if Redis operation fails
       return false;
     }
   }
@@ -355,7 +362,7 @@ export class EmailValidationService {
     };
   }
   
-  // ZeroBounce API check with strict timeout
+  // ZeroBounce API check with configured timeout
   async checkWithZeroBounce(email) {
     console.log('ZEROBOUNCE_CHECK: Starting validation', { email });
 
@@ -371,6 +378,18 @@ export class EmailValidationService {
       };
     }
 
+    // Skip if ZeroBounce is explicitly disabled
+    if (this.config.useZeroBounce === false) {
+      console.log('ZEROBOUNCE_CHECK: ZeroBounce is disabled');
+      return {
+        email,
+        status: 'check_skipped',
+        recheckNeeded: true,
+        source: 'configuration',
+        message: 'ZeroBounce is disabled by configuration'
+      };
+    }
+
     try {
       const url = new URL('https://api.zerobounce.net/v2/validate');
       url.searchParams.append('api_key', this.config.zeroBounceApiKey);
@@ -379,18 +398,16 @@ export class EmailValidationService {
       
       console.log('ZEROBOUNCE_CHECK: Sending request', { url: url.toString() });
 
-      // Add strict timeout to fetch request - 3 seconds max
+      // Use configured timeout for ZeroBounce
       const controller = new AbortController();
       const timeoutId = setTimeout(() => {
         console.log('ZEROBOUNCE_CHECK: Aborting request due to timeout');
         controller.abort();
-      }, 3000);
+      }, this.timeouts.zeroBounce);
       
       try {
         const response = await fetch(url.toString(), { 
-          signal: controller.signal,
-          // Set additional fetch timeout options
-          timeout: 3000
+          signal: controller.signal 
         });
         clearTimeout(timeoutId);
         
@@ -444,7 +461,7 @@ export class EmailValidationService {
             recheckNeeded = true;
         }
         
-        // If valid, try to add to our known valid emails but don't wait for it
+        // If valid, try to add to known valid emails but don't wait for it
         if (status === 'valid') {
           this.addToKnownValidEmails(email).catch(err => {
             console.error('Failed to add valid email to Redis:', err.message);
@@ -477,7 +494,7 @@ export class EmailValidationService {
       
       // If AbortError, it's a timeout
       if (error.name === 'AbortError') {
-        console.error('ZEROBOUNCE_TIMEOUT: Request timed out after 3 seconds');
+        console.error('ZEROBOUNCE_TIMEOUT: Request timed out after', this.timeouts.zeroBounce, 'ms');
       }
       
       return {
@@ -490,9 +507,9 @@ export class EmailValidationService {
     }
   }
   
-  // Main validation function with strict timeout handling
+  // Main validation function with fallbacks but keeps services enabled
   async validateEmail(email, options = {}) {
-    const { skipZeroBounce = false, timeoutMs = 5000 } = options;
+    const { skipZeroBounce = false, timeoutMs = this.timeouts.validation } = options;
     
     console.log('VALIDATION_PROCESS: Starting email validation', { 
       email, 
@@ -564,7 +581,7 @@ export class EmailValidationService {
       corrected: correctedEmail
     });
     
-    // Step 2: Check if it's a known valid email (if Redis is enabled)
+    // Step 2: Check if it's a known valid email (if Redis is available)
     try {
       result.isKnownValid = await this.isKnownValidEmail(correctedEmail);
       result.validationSteps.push({
@@ -587,6 +604,7 @@ export class EmailValidationService {
         passed: false,
         error: error.message
       });
+      // Continue with validation even if Redis check fails
     }
     
     // Step 3: Check if domain appears valid
@@ -604,7 +622,7 @@ export class EmailValidationService {
     }
     
     // Step 4: If enabled and not skipped, check with ZeroBounce
-    if (this.config.useZeroBounce && !skipZeroBounce) {
+    if (this.config.useZeroBounce !== false && !skipZeroBounce) {
       try {
         const bounceCheck = await this.checkWithZeroBounce(correctedEmail);
         
@@ -620,6 +638,7 @@ export class EmailValidationService {
           message: error.message
         });
         
+        // Continue with validation but mark as check_failed
         result.status = 'check_failed';
         result.recheckNeeded = true;
         result.validationSteps.push({
@@ -753,12 +772,12 @@ export class EmailValidationService {
         requestBody: JSON.stringify({ properties })
       });
 
-      // Add strict timeout to HubSpot API call - 8 seconds max for HubSpot
+      // Use configured timeout for HubSpot
       const controller = new AbortController();
       const timeoutId = setTimeout(() => {
         console.log('HUBSPOT_UPDATE: Aborting request due to timeout');
         controller.abort();
-      }, 8000);
+      }, this.timeouts.hubspot);
       
       try {
         // Log the full request details for debugging
