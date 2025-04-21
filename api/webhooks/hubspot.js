@@ -29,6 +29,8 @@ export default async function handler(req, res) {
     SKIP_SIGNATURE_VERIFICATION: process.env.SKIP_SIGNATURE_VERIFICATION
   });
   
+  console.log('Received webhook payload:', JSON.stringify(req.body, null, 2));
+  
   // Only allow POST method
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
@@ -87,10 +89,30 @@ function verifyHubspotSignature(req, config) {
 // Process the webhook data
 async function processWebhook(webhookData, config) {
   try {
-    // Support both original and simplified HubSpot webhook formats
-    const contactId = webhookData.objectId || webhookData.contactId;
-    const email = webhookData?.properties?.email?.value || webhookData.email;
+    console.log('Processing webhook data:', JSON.stringify(webhookData, null, 2));
+    
+    // Extract contactId from objectId
+    const contactId = webhookData.objectId;
+    
+    // Extract email based on webhook format
+    let email = null;
+    
+    // For property change webhook format
+    if (webhookData.propertyName === 'email' && webhookData.propertyValue) {
+      email = webhookData.propertyValue;
+    } 
+    // For standard webhook format with properties object
+    else if (webhookData.properties && webhookData.properties.email) {
+      email = webhookData.properties.email.value || webhookData.properties.email;
+    } 
+    // For simplified format
+    else if (webhookData.email) {
+      email = webhookData.email;
+    }
+    
     const subscriptionType = webhookData.subscriptionType || 'contact.propertyChange';
+
+    console.log('Extracted from webhook:', { contactId, email, subscriptionType });
 
     // Only proceed if we have an email
     if (!email) {
