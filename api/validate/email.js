@@ -31,7 +31,34 @@ export default async function handler(req, res) {
     // Log for debugging
     console.log('Processing email validation for:', email);
     
-    const result = await emailValidator.validateEmail(email);
+    // Set a timeout to ensure the function completes before Vercel's 10-second limit
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => {
+        reject(new Error('Function timeout to prevent Vercel runtime timeout'));
+      }, 8000); // Set to 8 seconds to ensure we return before Vercel's 10-second limit
+    });
+    
+    // Race between validation and timeout
+    const result = await Promise.race([
+      emailValidator.validateEmail(email),
+      timeoutPromise
+    ]).catch(error => {
+      console.error('Email validation timed out or failed:', error);
+      
+      // Return a partial result if we hit our safety timeout
+      if (error.message.includes('Function timeout')) {
+        return {
+          originalEmail: email,
+          currentEmail: email,
+          formatValid: emailValidator.isValidEmailFormat(email),
+          status: 'check_incomplete',
+          recheckNeeded: true,
+          error: 'Validation timed out'
+        };
+      }
+      
+      throw error;
+    });
     
     return res.status(200).json(result);
     
@@ -39,8 +66,7 @@ export default async function handler(req, res) {
     console.error('Error validating email:', error);
     return res.status(500).json({
       error: 'Error validating email',
-      details: error.message,
-      stack: error.stack
+      details: error.message
     });
   }
 }

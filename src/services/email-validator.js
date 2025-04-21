@@ -67,7 +67,11 @@ export class EmailValidationService {
 
     try {
       console.log('UPSTASH_CONNECTION_TEST: Attempting ping');
-      const pingResult = await this.redis.ping();
+      const pingResult = await this.withTimeout(
+        this.redis.ping(),
+        2000,
+        'Redis ping timeout'
+      );
       console.log('UPSTASH_CONNECTION_TEST: Ping successful', { result: pingResult });
     } catch (error) {
       console.error('UPSTASH_CONNECTION_TEST_FAILED:', {
@@ -78,8 +82,8 @@ export class EmailValidationService {
     }
   }
 
-  // Timeout wrapper method
-  async withTimeout(promise, timeoutMs = 3000, errorMessage = 'Operation timeout') {
+  // Timeout wrapper method with reduced timeout values
+  async withTimeout(promise, timeoutMs = 2000, errorMessage = 'Operation timeout') {
     console.log('TIMEOUT_WRAPPER: Initiating timeout-protected operation', {
       timeoutMs,
       errorMessage
@@ -128,7 +132,7 @@ export class EmailValidationService {
 
       const setResult = await this.withTimeout(
         this.redis.set(key, JSON.stringify(data), { ex: 30 * 24 * 60 * 60 }),
-        5000,
+        2000,
         'Redis SET timeout'
       );
       
@@ -150,7 +154,7 @@ export class EmailValidationService {
     }
   }
   
-  // Check if email exists in Redis store
+  // Check if email exists in Redis store with fallback
   async isKnownValidEmail(email) {
     if (!this.redis) {
       console.error('REDIS_GET_ERROR: Redis client not initialized');
@@ -164,7 +168,7 @@ export class EmailValidationService {
 
       const result = await this.withTimeout(
         this.redis.get(key),
-        5000,
+        2000,
         'Redis GET timeout'
       );
       
@@ -184,6 +188,7 @@ export class EmailValidationService {
         stack: error.stack
       });
       
+      // Continue with other validation steps if Redis fails
       return false;
     }
   }
@@ -277,7 +282,7 @@ export class EmailValidationService {
     }
   }
   
-  // ZeroBounce API check
+  // ZeroBounce API check with proper timeout handling
   async checkWithZeroBounce(email) {
     console.log('ZEROBOUNCE_CHECK: Starting validation', { email });
 
@@ -301,76 +306,85 @@ export class EmailValidationService {
       
       console.log('ZEROBOUNCE_CHECK: Sending request', { url: url.toString() });
 
-      const response = await fetch(url.toString());
+      // Add timeout to fetch request
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 3000); // 3 second timeout for ZeroBounce
       
-      if (!response.ok) {
-        console.error('ZEROBOUNCE_ERROR: API response not OK', {
-          status: response.status,
-          statusText: response.statusText
+      try {
+        const response = await fetch(url.toString(), { signal: controller.signal });
+        clearTimeout(timeoutId);
+        
+        if (!response.ok) {
+          console.error('ZEROBOUNCE_ERROR: API response not OK', {
+            status: response.status,
+            statusText: response.statusText
+          });
+          throw new Error(`ZeroBounce API error: ${response.status} ${response.statusText}`);
+        }
+        
+        const result = await response.json();
+        console.log('ZEROBOUNCE_CHECK: API response received', { 
+          status: result.status,
+          subStatus: result.sub_status
         });
-        throw new Error(`ZeroBounce API error: ${response.status} ${response.statusText}`);
-      }
-      
-      const result = await response.json();
-      console.log('ZEROBOUNCE_CHECK: API response received', { 
-        status: result.status,
-        subStatus: result.sub_status
-      });
-      
-      // Map ZeroBounce status to our simplified status
-      let status, subStatus, recheckNeeded;
-      
-      switch (result.status) {
-        case 'valid':
-          status = 'valid';
-          recheckNeeded = false;
-          break;
-        case 'invalid':
-          status = 'invalid';
-          subStatus = result.sub_status;
-          recheckNeeded = false;
-          break;
-        case 'catch-all':
-          status = 'unknown';
-          recheckNeeded = true;
-          break;
-        case 'unknown':
-          status = 'unknown';
-          recheckNeeded = true;
-          break;
-        case 'spamtrap':
-          status = 'invalid';
-          subStatus = 'spamtrap';
-          recheckNeeded = false;
-          break;
-        case 'abuse':
-          status = 'invalid';
-          subStatus = 'abuse';
-          recheckNeeded = false;
-          break;
-        default:
-          status = 'check_failed';
-          recheckNeeded = true;
-      }
-      
-      // If valid, add to our known valid emails
-      if (status === 'valid') {
-        await this.addToKnownValidEmails(email);
-      }
-      
-      const finalResult = {
-        email,
-        status,
-        subStatus,
-        recheckNeeded,
-        source: 'zerobounce',
-        details: result
-      };
+        
+        // Map ZeroBounce status to our simplified status
+        let status, subStatus, recheckNeeded;
+        
+        switch (result.status) {
+          case 'valid':
+            status = 'valid';
+            recheckNeeded = false;
+            break;
+          case 'invalid':
+            status = 'invalid';
+            subStatus = result.sub_status;
+            recheckNeeded = false;
+            break;
+          case 'catch-all':
+            status = 'unknown';
+            recheckNeeded = true;
+            break;
+          case 'unknown':
+            status = 'unknown';
+            recheckNeeded = true;
+            break;
+          case 'spamtrap':
+            status = 'invalid';
+            subStatus = 'spamtrap';
+            recheckNeeded = false;
+            break;
+          case 'abuse':
+            status = 'invalid';
+            subStatus = 'abuse';
+            recheckNeeded = false;
+            break;
+          default:
+            status = 'check_failed';
+            recheckNeeded = true;
+        }
+        
+        // If valid, add to our known valid emails
+        if (status === 'valid') {
+          await this.addToKnownValidEmails(email);
+        }
+        
+        const finalResult = {
+          email,
+          status,
+          subStatus,
+          recheckNeeded,
+          source: 'zerobounce',
+          details: result
+        };
 
-      console.log('ZEROBOUNCE_CHECK: Final result', finalResult);
-      
-      return finalResult;
-      
+        console.log('ZEROBOUNCE_CHECK: Final result', finalResult);
+        
+        return finalResult;
+      } catch (error) {
+        clearTimeout(timeoutId);
+        throw error;
+      }
     } catch (error) {
       console.error('ZEROBOUNCE_CHECK_ERROR:', {
         message: error.message,
@@ -378,6 +392,12 @@ export class EmailValidationService {
         email,
         stack: error.stack
       });
+      
+      // If AbortError, it's a timeout
+      if (error.name === 'AbortError') {
+        console.error('ZEROBOUNCE_TIMEOUT: Request timed out after 3 seconds');
+      }
+      
       return {
         email,
         status: 'check_failed',
@@ -388,7 +408,7 @@ export class EmailValidationService {
     }
   }
   
-  // Main validation function
+  // Main validation function with graceful timeout handling
   async validateEmail(email) {
     console.log('VALIDATION_PROCESS: Starting full email validation', { email });
 
@@ -438,21 +458,32 @@ export class EmailValidationService {
       correctedEmail 
     });
     
-    // Step 3: Check if it's a known valid email
-    result.isKnownValid = await this.isKnownValidEmail(correctedEmail);
-    result.validationSteps.push({
-      step: 'known_valid_check',
-      passed: result.isKnownValid
-    });
-    console.log('VALIDATION_PROCESS: Known valid check', { 
-      isKnownValid: result.isKnownValid 
-    });
-    
-    if (result.isKnownValid) {
-      result.status = 'valid';
-      result.recheckNeeded = false;
-      console.log('VALIDATION_PROCESS: Known valid email, early return');
-      return result;
+    // Step 3: Check if it's a known valid email - handle Redis errors gracefully
+    try {
+      result.isKnownValid = await this.isKnownValidEmail(correctedEmail);
+      result.validationSteps.push({
+        step: 'known_valid_check',
+        passed: result.isKnownValid
+      });
+      console.log('VALIDATION_PROCESS: Known valid check', { 
+        isKnownValid: result.isKnownValid 
+      });
+      
+      if (result.isKnownValid) {
+        result.status = 'valid';
+        result.recheckNeeded = false;
+        console.log('VALIDATION_PROCESS: Known valid email, early return');
+        return result;
+      }
+    } catch (error) {
+      console.error('VALIDATION_PROCESS: Known valid check failed, continuing', { 
+        error: error.message 
+      });
+      result.validationSteps.push({
+        step: 'known_valid_check',
+        passed: false,
+        error: error.message
+      });
     }
     
     // Step 4: Check if domain appears valid
@@ -465,13 +496,14 @@ export class EmailValidationService {
       domainValid: result.domainValid 
     });
     
-    // Step 5: If enabled, check with ZeroBounce
+    // Step 5: If enabled, check with ZeroBounce - with timeout protection
     console.log('VALIDATION_PROCESS: ZeroBounce configuration', { 
       useZeroBounce: this.config.useZeroBounce 
     });
 
     if (this.config.useZeroBounce) {
       try {
+        // We'll set a deadline for this entire function to ensure it completes within Vercel's time limit
         const bounceCheck = await this.checkWithZeroBounce(correctedEmail);
         console.log('VALIDATION_PROCESS: ZeroBounce check result', { 
           status: bounceCheck.status,
@@ -492,8 +524,13 @@ export class EmailValidationService {
           name: error.name,
           stack: error.stack
         });
+        
         result.status = 'check_failed';
         result.recheckNeeded = true;
+        result.validationSteps.push({
+          step: 'zerobounce_check',
+          error: error.message
+        });
       }
     } else {
       console.log('VALIDATION_PROCESS: ZeroBounce not enabled');
@@ -509,7 +546,7 @@ export class EmailValidationService {
     return result;
   }
   
-  // Process a batch of emails
+  // Process a batch of emails with better timeout handling
   async validateBatch(emails) {
     console.log('BATCH_VALIDATION: Starting batch validation', { 
       totalEmails: emails.length 
@@ -520,7 +557,13 @@ export class EmailValidationService {
     for (const email of emails) {
       try {
         console.log('BATCH_VALIDATION: Validating individual email', { email });
-        const result = await this.validateEmail(email);
+        // Set a timeout for individual email validation
+        const validationPromise = this.validateEmail(email);
+        const result = await this.withTimeout(
+          validationPromise,
+          8000, // 8-second timeout for each email validation
+          `Validation timeout for email: ${email}`
+        );
         results.push(result);
         
         // Add a small delay to avoid rate limits if using ZeroBounce
@@ -549,7 +592,7 @@ export class EmailValidationService {
     return results;
   }
   
-  // Update HubSpot contact
+  // Update HubSpot contact with timeout protection
   async updateHubSpotContact(contactId, validationResult) {
     console.log('HUBSPOT_UPDATE: Starting contact update', { 
       contactId, 
@@ -597,36 +640,45 @@ export class EmailValidationService {
         properties: Object.keys(properties) 
       });
 
-      // Send update request
-      const response = await fetch(
-        `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}`,
-        fetchOptions
-      );
+      // Add timeout to HubSpot API call
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 3000); // 3 second timeout
       
-      // Check response
-      if (!response.ok) {
-        const errorBody = await response.text();
-        console.error('HUBSPOT_UPDATE_ERROR: API response not OK', {
-          status: response.status,
-          statusText: response.statusText,
-          errorBody
+      try {
+        // Send update request with abort signal
+        const response = await fetch(
+          `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}`,
+          { ...fetchOptions, signal: controller.signal }
+        );
+        clearTimeout(timeoutId);
+        
+        // Check response
+        if (!response.ok) {
+          const errorBody = await response.text();
+          console.error('HUBSPOT_UPDATE_ERROR: API response not OK', {
+            status: response.status,
+            statusText: response.statusText,
+            errorBody
+          });
+          throw new Error(`HubSpot API error: ${response.status} ${response.statusText}`);
+        }
+        
+        // Parse and log successful response
+        const data = await response.json();
+        console.log('HUBSPOT_UPDATE: Update successful', { 
+          contactId, 
+          responseId: data.id 
         });
-        throw new Error(`HubSpot API error: ${response.status} ${response.statusText}`);
+        
+        return {
+          success: true,
+          contactId,
+          hubspotResponse: data
+        };
+      } catch (error) {
+        clearTimeout(timeoutId);
+        throw error;
       }
-      
-      // Parse and log successful response
-      const data = await response.json();
-      console.log('HUBSPOT_UPDATE: Update successful', { 
-        contactId, 
-        responseId: data.id 
-      });
-      
-      return {
-        success: true,
-        contactId,
-        hubspotResponse: data
-      };
-      
     } catch (error) {
       console.error('HUBSPOT_UPDATE_FATAL_ERROR:', {
         contactId,
@@ -634,6 +686,16 @@ export class EmailValidationService {
         name: error.name,
         stack: error.stack
       });
+      
+      // Special handling for AbortError (timeout)
+      if (error.name === 'AbortError') {
+        return {
+          success: false,
+          contactId,
+          error: 'HubSpot API request timed out'
+        };
+      }
+      
       return {
         success: false,
         contactId,
@@ -641,4 +703,4 @@ export class EmailValidationService {
       };
     }
   }
-}//stable1
+}
