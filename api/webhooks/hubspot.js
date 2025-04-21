@@ -167,12 +167,39 @@ async function processWebhookEvent(event, config) {
       };
     }
 
-    // Added detailed logging before validation
+    // Added detailed step-by-step logging before validation
     console.log(`Starting email validation for: ${email}`);
     
-    // Validate the email with better error handling
+    // Validate the email with step-by-step logging
     let validationResult;
     try {
+      console.log('Step 1: Initializing validation');
+      
+      // Log Redis config (masking sensitive data)
+      console.log('Redis configuration:', {
+        url: config.upstash.url ? 'CONFIGURED' : 'MISSING',
+        token: config.upstash.token ? 'CONFIGURED' : 'MISSING'
+      });
+      
+      // Test Redis connection first
+      try {
+        console.log('Testing Redis connection...');
+        await emailValidator.redis.ping();
+        console.log('Redis connection successful');
+      } catch (redisError) {
+        console.error('Redis connection failed:', redisError);
+        throw new Error(`Redis connection error: ${redisError.message}`);
+      }
+      
+      console.log('Step 2: Checking email format');
+      const formatValid = emailValidator.isValidEmailFormat(email);
+      console.log('Format check result:', formatValid);
+      
+      console.log('Step 3: Correcting typos');
+      const typoResult = emailValidator.correctEmailTypos(email);
+      console.log('Typo correction result:', typoResult);
+      
+      console.log('Step 4: Proceeding with full validation');
       validationResult = await emailValidator.validateEmail(email);
       console.log('Email validation completed:', validationResult);
     } catch (validationError) {
@@ -187,6 +214,11 @@ async function processWebhookEvent(event, config) {
 
     // Added detailed logging before HubSpot update
     console.log(`Updating HubSpot contact ${contactId} with validation results`);
+    
+    // Log HubSpot configuration
+    console.log('HubSpot configuration:', {
+      apiKey: config.hubspot.apiKey ? 'CONFIGURED' : 'MISSING'
+    });
     
     // Update the contact in HubSpot with better error handling
     let updateResult;
