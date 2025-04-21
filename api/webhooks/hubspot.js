@@ -91,28 +91,58 @@ async function processWebhook(webhookData, config) {
   try {
     console.log('Processing webhook data:', JSON.stringify(webhookData, null, 2));
     
+    // Handle array of events - common in HubSpot webhooks
+    if (Array.isArray(webhookData)) {
+      console.log('Webhook contains an array of events, processing each one');
+      
+      const results = [];
+      for (const event of webhookData) {
+        const result = await processWebhookEvent(event, config);
+        results.push(result);
+      }
+      
+      return {
+        success: true,
+        processingResults: results
+      };
+    } else {
+      // Process single event
+      return await processWebhookEvent(webhookData, config);
+    }
+  } catch (error) {
+    console.error('Error processing webhook:', error);
+    return {
+      success: false,
+      error: error.message
+    };
+  }
+}
+
+// Process a single webhook event
+async function processWebhookEvent(event, config) {
+  try {    
     // Extract contactId from objectId
-    const contactId = webhookData.objectId;
+    const contactId = event.objectId;
     
     // Extract email based on webhook format
     let email = null;
     
     // For property change webhook format
-    if (webhookData.propertyName === 'email' && webhookData.propertyValue) {
-      email = webhookData.propertyValue;
+    if (event.propertyName === 'email' && event.propertyValue) {
+      email = event.propertyValue;
     } 
     // For standard webhook format with properties object
-    else if (webhookData.properties && webhookData.properties.email) {
-      email = webhookData.properties.email.value || webhookData.properties.email;
+    else if (event.properties && event.properties.email) {
+      email = event.properties.email.value || event.properties.email;
     } 
     // For simplified format
-    else if (webhookData.email) {
-      email = webhookData.email;
+    else if (event.email) {
+      email = event.email;
     }
     
-    const subscriptionType = webhookData.subscriptionType || 'contact.propertyChange';
+    const subscriptionType = event.subscriptionType || 'contact.propertyChange';
 
-    console.log('Extracted from webhook:', { contactId, email, subscriptionType });
+    console.log('Extracted from webhook event:', { contactId, email, subscriptionType });
 
     // Only proceed if we have an email
     if (!email) {
@@ -149,9 +179,8 @@ async function processWebhook(webhookData, config) {
       validationResult,
       updateResult
     };
-    
   } catch (error) {
-    console.error('Error processing webhook:', error);
+    console.error('Error processing webhook event:', error);
     return {
       success: false,
       error: error.message
