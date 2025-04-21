@@ -23,6 +23,12 @@ const config = {
 const emailValidator = new EmailValidationService(config);
 
 export default async function handler(req, res) {
+  // Debug logging for environment variables
+  console.log('Environment variables:', {
+    NODE_ENV: process.env.NODE_ENV,
+    SKIP_SIGNATURE_VERIFICATION: process.env.SKIP_SIGNATURE_VERIFICATION
+  });
+  
   // Only allow POST method
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
@@ -50,8 +56,9 @@ export default async function handler(req, res) {
 
 // Verify the HubSpot signature
 function verifyHubspotSignature(req, config) {
-  // Skip verification in development if configured
-  if (config.environment === 'development' && config.skipSignatureVerification) {
+  // Skip verification if explicitly configured to do so, regardless of environment
+  if (config.skipSignatureVerification) {
+    console.log('Skipping signature verification as configured');
     return true;
   }
   
