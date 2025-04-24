@@ -21,10 +21,10 @@ const config = {
   skipSignatureVerification: process.env.SKIP_SIGNATURE_VERIFICATION === 'true',
   // Configure timeout values
   timeouts: {
-    redis: 8000,         // Redis operations timeout in ms 2
-    zeroBounce: 8000,    // ZeroBounce API timeout in ms 4
+    redis: 2000,         // Redis operations timeout in ms
+    zeroBounce: 4000,    // ZeroBounce API timeout in ms
     hubspot: 8000,       // HubSpot API timeout in ms
-    validation: 8000,    // Total validation timeout in ms 6
+    validation: 6000,    // Total validation timeout in ms
     webhook: 8000        // Webhook processing timeout in ms
   }
 };

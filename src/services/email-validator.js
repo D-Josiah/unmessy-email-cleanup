@@ -11,42 +11,30 @@ export class EmailValidationService {
                            config.upstash.token &&
                            config.useRedis !== false);
     
-    // Timeouts configuration with defaults
+    // Timeouts configuration with defaults - shorter timeouts to prevent HubSpot flow hanging
     this.timeouts = {
-      redis: config.timeouts?.redis || 2000,
-      zeroBounce: config.timeouts?.zeroBounce || 4000,
-      hubspot: config.timeouts?.hubspot || 8000,
-      validation: config.timeouts?.validation || 6000,
-      webhook: config.timeouts?.webhook || 8000
+      redis: config.timeouts?.redis || 1500,
+      zeroBounce: config.timeouts?.zeroBounce || 3000,
+      hubspot: config.timeouts?.hubspot || 5000,
+      validation: config.timeouts?.validation || 4000, 
+      webhook: config.timeouts?.webhook || 6000
     };
 
-    // Initialize Redis if enabled
+    // Initialize Redis asynchronously, don't block main operations
     if (this.redisEnabled) {
       try {
-        console.log('UPSTASH_INIT: Initializing Redis client', {
-          url: config.upstash.url ? 'URL PROVIDED' : 'NO URL',
-          tokenProvided: !!config.upstash.token
-        });
-
+        console.log('UPSTASH_INIT: Initializing Redis client');
         this.redis = new Redis({
           url: config.upstash.url,
           token: config.upstash.token,
         });
-
-        // Test connection but don't block initialization and don't disable Redis if test fails
-        this.testRedisConnection().catch(err => {
-          console.error('Redis connection test failed:', err.message);
-          // Don't disable Redis, just log the error
-        });
+        
+        // Test connection in background without blocking
+        this._testRedisConnectionAsync();
       } catch (error) {
-        console.error('UPSTASH_INIT_ERROR:', {
-          message: error.message,
-          stack: error.stack
-        });
+        console.error('UPSTASH_INIT_ERROR:', { message: error.message });
         // Still keep Redis enabled for future attempts
       }
-    } else {
-      console.log('UPSTASH_INIT: Redis not configured');
     }
     
     // Common email domain typos
@@ -68,194 +56,143 @@ export class EmailValidationService {
     
     // Extended list of common domains for local validation
     this.commonValidDomains = [
-      'gmail.com', 
-      'outlook.com', 
-      'hotmail.com', 
-      'yahoo.com', 
-      'icloud.com', 
-      'aol.com',
-      'protonmail.com',
-      'fastmail.com',
-      'mail.com',
-      'zoho.com',
-      'yandex.com',
-      'gmx.com',
-      'live.com',
-      'msn.com',
-      'me.com',
-      'mac.com',
-      'googlemail.com',
-      'pm.me',
-      'tutanota.com',
-      'mailbox.org'
+      'gmail.com', 'outlook.com', 'hotmail.com', 'yahoo.com', 'icloud.com', 
+      'aol.com', 'protonmail.com', 'fastmail.com', 'mail.com', 'zoho.com',
+      'yandex.com', 'gmx.com', 'live.com', 'msn.com', 'me.com', 'mac.com', 
+      'googlemail.com', 'pm.me', 'tutanota.com', 'mailbox.org'
     ];
   }
 
-  // Connection test method with configured timeout
-  async testRedisConnection() {
-    if (!this.redis) {
-      console.error('UPSTASH_CONNECTION_TEST: Redis client not initialized');
-      return false;
-    }
-
+  // Asynchronous test without blocking operations
+  async _testRedisConnectionAsync() {
+    if (!this.redis) return;
+    
     try {
-      console.log('UPSTASH_CONNECTION_TEST: Attempting ping');
-      const pingResult = await this.withTimeout(
-        this.redis.ping(),
-        this.timeouts.redis,
-        'Redis ping timeout'
-      );
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), this.timeouts.redis);
+      
+      const pingResult = await this.redis.ping({ signal: controller.signal });
+      clearTimeout(timeoutId);
       console.log('UPSTASH_CONNECTION_TEST: Ping successful', { result: pingResult });
-      return true;
     } catch (error) {
-      console.error('UPSTASH_CONNECTION_TEST_FAILED:', {
-        message: error.message,
-        name: error.name,
-        stack: error.stack
-      });
-      return false;
+      console.error('UPSTASH_CONNECTION_TEST_FAILED:', { message: error.message });
+      // Non-blocking - just log the error
     }
   }
 
-  // Timeout wrapper method with configurable timeout
-  async withTimeout(promise, timeoutMs, errorMessage = 'Operation timeout') {
-    console.log('TIMEOUT_WRAPPER: Initiating timeout-protected operation', {
-      timeoutMs,
-      errorMessage
-    });
-
-    const timeout = new Promise((_, reject) => 
-      setTimeout(() => {
-        console.warn('TIMEOUT_WRAPPER: Operation timed out', { timeoutMs, errorMessage });
-        reject(new Error(errorMessage));
-      }, timeoutMs)
-    );
+  // Generic timeout wrapper with AbortController
+  async withTimeout(promiseFn, timeoutMs, errorMessage = 'Operation timeout') {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
     
     try {
-      const result = await Promise.race([promise, timeout]);
-      console.log('TIMEOUT_WRAPPER: Operation completed successfully');
+      // Execute the function with the abort signal
+      const result = await promiseFn(controller.signal);
+      clearTimeout(timeoutId);
       return result;
     } catch (error) {
-      console.error('TIMEOUT_WRAPPER: Operation failed', {
-        message: error.message,
-        name: error.name,
-        stack: error.stack
-      });
+      clearTimeout(timeoutId);
+      if (error.name === 'AbortError') {
+        throw new Error(errorMessage);
+      }
       throw error;
     }
   }
   
-  // Add email to Redis store - Skip if Redis operation fails but don't disable Redis
-  async addToKnownValidEmails(email) {
-    if (!this.redisEnabled || !this.redis) {
-      console.log('REDIS_ADD: Redis not available, skipping operation');
-      return false;
-    }
-
-    const key = `email:${email}`;
-    const data = {
-      validatedAt: new Date().toISOString(),
-      source: 'validation-service'
-    };
-    
-    try {
-      console.log('REDIS_ADD: Attempting to store email', { 
-        email, 
-        key, 
-        expirationSeconds: 30 * 24 * 60 * 60 
-      });
-
-      const setResult = await this.withTimeout(
-        this.redis.set(key, JSON.stringify(data), { ex: 30 * 24 * 60 * 60 }),
-        this.timeouts.redis,
-        'Redis SET timeout'
-      );
-      
-      console.log('REDIS_ADD: Store operation result', { 
-        result: setResult,
-        success: setResult === 'OK' 
-      });
-
-      return setResult === 'OK';
-    } catch (error) {
-      console.error('REDIS_ADD_ERROR:', {
-        message: error.message,
-        name: error.name,
-        email,
-        stack: error.stack
-      });
-      
-      // Skip this operation but keep Redis enabled
-      return false;
-    }
-  }
-  
-  // Check if email exists in Redis store - Skip if operation fails but don't disable Redis
+  // Non-blocking Redis check - doesn't throw, returns false on failure
   async isKnownValidEmail(email) {
     if (!this.redisEnabled || !this.redis) {
-      console.log('REDIS_GET: Redis not available, skipping check');
+      console.log('REDIS_CHECK: Redis not enabled, skipping check');
       return false;
     }
 
-    const key = `email:${email}`;
-    
     try {
-      console.log('REDIS_GET: Attempting to retrieve email', { email, key });
-
+      // Use AbortController and timeout
       const result = await this.withTimeout(
-        this.redis.get(key),
+        async (signal) => {
+          const key = `email:${email}`;
+          console.log('REDIS_CHECK: Attempting to check if email exists in Redis', { email, key });
+          const result = await this.redis.get(key, { signal });
+          const found = !!result;
+          console.log('REDIS_CHECK: Completed successfully', { 
+            email, 
+            found, 
+            resultType: typeof result 
+          });
+          return found;
+        },
         this.timeouts.redis,
-        'Redis GET timeout'
+        'Redis check timeout'
       );
       
-      const isKnown = !!result;
-      console.log('REDIS_GET: Retrieval result', { 
-        email, 
-        found: isKnown,
-        resultType: typeof result
-      });
+      if (result) {
+        console.log('REDIS_CHECK: Email found in Redis database', { email });
+      } else {
+        console.log('REDIS_CHECK: Email not found in Redis database', { email });
+      }
       
-      return isKnown;
+      return result;
     } catch (error) {
-      console.error('REDIS_GET_ERROR:', {
-        message: error.message,
-        name: error.name,
-        email,
-        stack: error.stack
-      });
-      
-      // Continue with other validation steps if Redis operation fails
-      return false;
+      console.error('REDIS_GET_ERROR:', { message: error.message, email });
+      return false; // Continue validation on failure
     }
   }
   
-  // Basic email format check
+  // Non-blocking Redis add - doesn't throw, returns false on failure
+  async addToKnownValidEmails(email) {
+    if (!this.redisEnabled || !this.redis) {
+      return false;
+    }
+
+    try {
+      return await this.withTimeout(
+        async (signal) => {
+          const key = `email:${email}`;
+          const data = {
+            validatedAt: new Date().toISOString(),
+            source: 'validation-service'
+          };
+          
+          const setResult = await this.redis.set(
+            key, 
+            JSON.stringify(data), 
+            { ex: 30 * 24 * 60 * 60, signal }
+          );
+          
+          return setResult === 'OK';
+        },
+        this.timeouts.redis,
+        'Redis add timeout'
+      );
+    } catch (error) {
+      console.error('REDIS_ADD_ERROR:', { message: error.message, email });
+      return false; // Don't let Redis failures block
+    }
+  }
+  
+  // Basic format validation - fast and synchronous  
   isValidEmailFormat(email) {
-    // More comprehensive email validation regex
     const emailRegex = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
     return emailRegex.test(email);
   }
   
-  // Clean and correct common email typos
+  // Typo correction - fast and synchronous
   correctEmailTypos(email) {
-    console.log('TYPO_CORRECTION: Starting email correction', { input: email });
-
     if (!email) {
-      console.log('TYPO_CORRECTION: Empty email, returning as-is');
       return { corrected: false, email };
     }
     
     let corrected = false;
     let cleanedEmail = email.trim().toLowerCase();
     
-    // Remove any spaces
+    // Remove spaces
     const noSpaceEmail = cleanedEmail.replace(/\s/g, '');
     if (noSpaceEmail !== cleanedEmail) {
       cleanedEmail = noSpaceEmail;
       corrected = true;
     }
     
-    // Check for common domain typos
+    // Check for domain typos
     const [localPart, domain] = cleanedEmail.split('@');
     
     if (domain && this.domainTypos[domain]) {
@@ -263,7 +200,7 @@ export class EmailValidationService {
       corrected = true;
     }
     
-    // Check for + alias in Gmail
+    // Handle Gmail aliases
     if (this.config.removeGmailAliases && domain === 'gmail.com' && localPart.includes('+')) {
       const baseLocal = localPart.split('+')[0];
       cleanedEmail = `${baseLocal}@gmail.com`;
@@ -284,40 +221,25 @@ export class EmailValidationService {
       }
     }
     
-    console.log('TYPO_CORRECTION: Correction result', { 
-      corrected, 
-      originalEmail: email, 
-      correctedEmail: cleanedEmail 
-    });
-    
     return { corrected, email: cleanedEmail };
   }
   
-  // Check if email domain is valid
+  // Fast domain check - synchronous
   isValidDomain(email) {
     try {
       const domain = email.split('@')[1];
-      
       if (!domain) return false;
-      
       return this.commonValidDomains.includes(domain);
     } catch (error) {
-      console.error('DOMAIN_VALIDATION_ERROR:', {
-        message: error.message,
-        email
-      });
       return false;
     }
   }
   
-  // Quick validation that doesn't use external services
+  // Fast local validation without external services
   quickValidate(email) {
-    console.log('QUICK_VALIDATION: Starting quick validation for', { email });
-    
     // Step 1: Format check
     const formatValid = this.isValidEmailFormat(email);
     if (!formatValid) {
-      console.log('QUICK_VALIDATION: Invalid format');
       return {
         originalEmail: email,
         currentEmail: email,
@@ -330,21 +252,12 @@ export class EmailValidationService {
       };
     }
     
-    // Step 2: Correct common typos
+    // Step 2: Correct typos
     const { corrected, email: correctedEmail } = this.correctEmailTypos(email);
     
     // Step 3: Domain check
     const domainValid = this.isValidDomain(correctedEmail);
-    
-    // Determine status based on local validation only
     const status = domainValid ? 'valid' : 'unknown';
-    
-    console.log('QUICK_VALIDATION: Completed', { 
-      formatValid, 
-      corrected, 
-      domainValid, 
-      status 
-    });
     
     return {
       originalEmail: email,
@@ -362,141 +275,108 @@ export class EmailValidationService {
     };
   }
   
-  // ZeroBounce API check with configured timeout
+  // ZeroBounce check with proper timeout handling
   async checkWithZeroBounce(email) {
-    console.log('ZEROBOUNCE_CHECK: Starting validation', { email });
-
-    // Validate ZeroBounce configuration
-    if (!this.config.zeroBounceApiKey) {
-      console.error('ZEROBOUNCE_ERROR: API key not configured');
-      return {
-        email,
-        status: 'check_failed',
-        recheckNeeded: true,
-        source: 'zerobounce',
-        error: 'ZeroBounce API key not configured'
-      };
-    }
-
-    // Skip if ZeroBounce is explicitly disabled
-    if (this.config.useZeroBounce === false) {
-      console.log('ZEROBOUNCE_CHECK: ZeroBounce is disabled');
+    if (!this.config.zeroBounceApiKey || this.config.useZeroBounce === false) {
+      console.log('ZEROBOUNCE_CHECK: ZeroBounce not configured or disabled, skipping check');
       return {
         email,
         status: 'check_skipped',
         recheckNeeded: true,
-        source: 'configuration',
-        message: 'ZeroBounce is disabled by configuration'
+        source: 'configuration'
       };
     }
 
     try {
-      const url = new URL('https://api.zerobounce.net/v2/validate');
-      url.searchParams.append('api_key', this.config.zeroBounceApiKey);
-      url.searchParams.append('email', email);
-      url.searchParams.append('ip_address', '');
+      console.log('ZEROBOUNCE_CHECK: Starting validation for email', { email });
       
-      console.log('ZEROBOUNCE_CHECK: Sending request', { url: url.toString() });
-
-      // Use configured timeout for ZeroBounce
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => {
-        console.log('ZEROBOUNCE_CHECK: Aborting request due to timeout');
-        controller.abort();
-      }, this.timeouts.zeroBounce);
+      const result = await this.withTimeout(
+        async (signal) => {
+          const url = new URL('https://api.zerobounce.net/v2/validate');
+          url.searchParams.append('api_key', this.config.zeroBounceApiKey);
+          url.searchParams.append('email', email);
+          url.searchParams.append('ip_address', '');
+          
+          console.log('ZEROBOUNCE_CHECK: Sending request to ZeroBounce API', { 
+            email,
+            url: url.toString().replace(this.config.zeroBounceApiKey, '[REDACTED]')
+          });
+          
+          const response = await fetch(url.toString(), { signal });
+          
+          if (!response.ok) {
+            throw new Error(`ZeroBounce API error: ${response.status} ${response.statusText}`);
+          }
+          
+          const result = await response.json();
+          
+          console.log('ZEROBOUNCE_CHECK: Received response from ZeroBounce API', { 
+            email,
+            status: result.status,
+            subStatus: result.sub_status
+          });
+          
+          // Map ZeroBounce status to our status
+          let status, subStatus, recheckNeeded;
+          
+          switch (result.status) {
+            case 'valid':
+              status = 'valid';
+              recheckNeeded = false;
+              break;
+            case 'invalid':
+              status = 'invalid';
+              subStatus = result.sub_status;
+              recheckNeeded = false;
+              break;
+            case 'catch-all':
+            case 'unknown':
+              status = 'unknown';
+              recheckNeeded = true;
+              break;
+            case 'spamtrap':
+              status = 'invalid';
+              subStatus = 'spamtrap';
+              recheckNeeded = false;
+              break;
+            case 'abuse':
+              status = 'invalid';
+              subStatus = 'abuse';
+              recheckNeeded = false;
+              break;
+            default:
+              status = 'check_failed';
+              recheckNeeded = true;
+          }
+          
+          console.log('ZEROBOUNCE_CHECK: Completed successfully', { 
+            email, 
+            status, 
+            subStatus,
+            recheckNeeded
+          });
+          
+          // If valid, try to add to Redis in background (don't await)
+          if (status === 'valid') {
+            this.addToKnownValidEmails(email).catch(() => {});
+          }
+          
+          return {
+            email,
+            status,
+            subStatus,
+            recheckNeeded,
+            source: 'zerobounce',
+            details: result
+          };
+        },
+        this.timeouts.zeroBounce,
+        'ZeroBounce check timeout'
+      );
       
-      try {
-        const response = await fetch(url.toString(), { 
-          signal: controller.signal 
-        });
-        clearTimeout(timeoutId);
-        
-        if (!response.ok) {
-          console.error('ZEROBOUNCE_ERROR: API response not OK', {
-            status: response.status,
-            statusText: response.statusText
-          });
-          throw new Error(`ZeroBounce API error: ${response.status} ${response.statusText}`);
-        }
-        
-        const result = await response.json();
-        console.log('ZEROBOUNCE_CHECK: API response received', { 
-          status: result.status,
-          subStatus: result.sub_status
-        });
-        
-        // Map ZeroBounce status to our simplified status
-        let status, subStatus, recheckNeeded;
-        
-        switch (result.status) {
-          case 'valid':
-            status = 'valid';
-            recheckNeeded = false;
-            break;
-          case 'invalid':
-            status = 'invalid';
-            subStatus = result.sub_status;
-            recheckNeeded = false;
-            break;
-          case 'catch-all':
-            status = 'unknown';
-            recheckNeeded = true;
-            break;
-          case 'unknown':
-            status = 'unknown';
-            recheckNeeded = true;
-            break;
-          case 'spamtrap':
-            status = 'invalid';
-            subStatus = 'spamtrap';
-            recheckNeeded = false;
-            break;
-          case 'abuse':
-            status = 'invalid';
-            subStatus = 'abuse';
-            recheckNeeded = false;
-            break;
-          default:
-            status = 'check_failed';
-            recheckNeeded = true;
-        }
-        
-        // If valid, try to add to known valid emails but don't wait for it
-        if (status === 'valid') {
-          this.addToKnownValidEmails(email).catch(err => {
-            console.error('Failed to add valid email to Redis:', err.message);
-          });
-        }
-        
-        const finalResult = {
-          email,
-          status,
-          subStatus,
-          recheckNeeded,
-          source: 'zerobounce',
-          details: result
-        };
-
-        console.log('ZEROBOUNCE_CHECK: Final result', finalResult);
-        
-        return finalResult;
-      } catch (error) {
-        clearTimeout(timeoutId);
-        throw error;
-      }
+      return result;
     } catch (error) {
-      console.error('ZEROBOUNCE_CHECK_ERROR:', {
-        message: error.message,
-        name: error.name,
-        email,
-        stack: error.stack
-      });
-      
-      // If AbortError, it's a timeout
-      if (error.name === 'AbortError') {
-        console.error('ZEROBOUNCE_TIMEOUT: Request timed out after', this.timeouts.zeroBounce, 'ms');
-      }
-      
+      console.error('ZEROBOUNCE_CHECK_ERROR:', { message: error.message, email });
       return {
         email,
         status: 'check_failed',
@@ -507,348 +387,249 @@ export class EmailValidationService {
     }
   }
   
-  // Main validation function with fallbacks but keeps services enabled
+  // Main validation with proper timeout and graceful fallback
   async validateEmail(email, options = {}) {
     const { skipZeroBounce = false, timeoutMs = this.timeouts.validation } = options;
     
-    console.log('VALIDATION_PROCESS: Starting email validation', { 
+    console.log('VALIDATION_PROCESS: Starting validation for email', { 
       email, 
-      skipZeroBounce,
-      timeoutMs
+      skipZeroBounce, 
+      timeoutMs 
     });
-
-    // Start with quick validation that doesn't depend on external services
+    
+    // Start with quick validation (synchronous, always works)
     const quickResult = this.quickValidate(email);
     
-    // If format is invalid, we can return immediately
+    // If format is invalid, return immediately
     if (!quickResult.formatValid) {
-      console.log('VALIDATION_PROCESS: Invalid format, using quick result');
+      console.log('VALIDATION_PROCESS: Invalid format detected, returning quick result');
       return quickResult;
     }
     
-    // Try to get a more detailed validation, but with timeout protection
-    const validationPromise = this._fullValidation(quickResult.currentEmail, skipZeroBounce);
-    
-    // Set a timeout to ensure we don't hang
-    const timeoutPromise = new Promise((_, reject) => {
-      setTimeout(() => {
-        console.warn('VALIDATION_PROCESS: Timeout after', { timeoutMs });
-        reject(new Error('Validation timeout'));
-      }, timeoutMs);
-    });
-    
+    // Set a global timeout for the entire validation process
     try {
-      // Race between validation and timeout
-      const fullResult = await Promise.race([validationPromise, timeoutPromise]);
-      console.log('VALIDATION_PROCESS: Completed successfully');
-      return fullResult;
-    } catch (error) {
-      console.error('VALIDATION_PROCESS: Error or timeout', { 
-        error: error.message, 
-        fallbackToQuick: true 
-      });
+      console.log('VALIDATION_PROCESS: Starting advanced validation checks');
       
-      // Fall back to quick result if full validation fails or times out
-      return quickResult;
-    }
-  }
-  
-  // Internal method for full validation with all checks
-  async _fullValidation(email, skipZeroBounce = false) {
-    const result = {
-      originalEmail: email,
-      currentEmail: email,
-      formatValid: true, // We already checked this in quickValidate
-      wasCorrected: false,
-      isKnownValid: false,
-      domainValid: false,
-      status: 'unknown',
-      subStatus: null,
-      recheckNeeded: true,
-      validationSteps: [
-        { step: 'format_check', passed: true }
-      ]
-    };
-    
-    // Step 1: Correct common typos (already done in quickValidate, but we need to track it)
-    const { corrected, email: correctedEmail } = this.correctEmailTypos(email);
-    result.wasCorrected = corrected;
-    result.currentEmail = correctedEmail;
-    result.validationSteps.push({
-      step: 'typo_correction',
-      applied: corrected,
-      original: email,
-      corrected: correctedEmail
-    });
-    
-    // Step 2: Check if it's a known valid email (if Redis is available)
-    try {
-      result.isKnownValid = await this.isKnownValidEmail(correctedEmail);
-      result.validationSteps.push({
-        step: 'known_valid_check',
-        passed: result.isKnownValid
-      });
+      const result = await this.withTimeout(
+        async () => {
+          // Log the process
+          console.log('VALIDATION_PROCESS: Running Redis and ZeroBounce checks in parallel');
+          
+          // Run Redis check and ZeroBounce check in parallel
+          const [isKnownValid, zeroBounceResult] = await Promise.allSettled([
+            this.isKnownValidEmail(quickResult.currentEmail),
+            skipZeroBounce ? null : this.checkWithZeroBounce(quickResult.currentEmail)
+          ]);
+          
+          // Start with the quick result and enhance it
+          const result = { ...quickResult };
+          
+          // Add Redis result if successful
+          if (isKnownValid.status === 'fulfilled' && isKnownValid.value === true) {
+            console.log('VALIDATION_PROCESS: Email found in Redis database, marking as valid', { 
+              email: quickResult.currentEmail 
+            });
+            
+            result.isKnownValid = true;
+            result.status = 'valid';
+            result.recheckNeeded = false;
+            result.validationSteps.push({ step: 'known_valid_check', passed: true });
+            return result;
+          } else {
+            console.log('VALIDATION_PROCESS: Email not found in Redis or check failed', {
+              email: quickResult.currentEmail,
+              status: isKnownValid.status
+            });
+            
+            result.isKnownValid = false;
+            result.validationSteps.push({ 
+              step: 'known_valid_check', 
+              passed: false, 
+              error: isKnownValid.status === 'rejected' ? isKnownValid.reason.message : null 
+            });
+          }
+          
+          // Add ZeroBounce result if available and successful
+          if (!skipZeroBounce && zeroBounceResult?.status === 'fulfilled' && zeroBounceResult.value) {
+            const bounceCheck = zeroBounceResult.value;
+            
+            console.log('VALIDATION_PROCESS: ZeroBounce check completed', {
+              email: quickResult.currentEmail,
+              status: bounceCheck.status,
+              subStatus: bounceCheck.subStatus
+            });
+            
+            // Only update if we got a definitive result
+            if (bounceCheck.status === 'valid' || bounceCheck.status === 'invalid') {
+              result.status = bounceCheck.status;
+              result.subStatus = bounceCheck.subStatus;
+              result.recheckNeeded = bounceCheck.recheckNeeded;
+            }
+            
+            result.validationSteps.push({
+              step: 'zerobounce_check',
+              result: bounceCheck
+            });
+          } else if (!skipZeroBounce) {
+            console.log('VALIDATION_PROCESS: ZeroBounce check failed or was skipped', {
+              email: quickResult.currentEmail,
+              error: zeroBounceResult?.reason?.message || 'Failed or skipped'
+            });
+            
+            result.validationSteps.push({
+              step: 'zerobounce_check',
+              error: zeroBounceResult?.reason?.message || 'Failed or skipped'
+            });
+          }
+          
+          console.log('VALIDATION_PROCESS: All validation steps completed successfully', {
+            email: quickResult.currentEmail,
+            finalStatus: result.status,
+            recheckNeeded: result.recheckNeeded
+          });
+          
+          return result;
+        },
+        timeoutMs,
+        'Validation timeout'
+      );
       
-      if (result.isKnownValid) {
-        result.status = 'valid';
-        result.recheckNeeded = false;
-        console.log('VALIDATION_PROCESS: Known valid email');
-        return result;
-      }
-    } catch (error) {
-      console.error('VALIDATION_PROCESS: Known valid check failed', { 
-        error: error.message 
-      });
-      result.validationSteps.push({
-        step: 'known_valid_check',
-        passed: false,
-        error: error.message
-      });
-      // Continue with validation even if Redis check fails
-    }
-    
-    // Step 3: Check if domain appears valid
-    result.domainValid = this.isValidDomain(correctedEmail);
-    result.validationSteps.push({
-      step: 'domain_check',
-      passed: result.domainValid
-    });
-    
-    // If domain is valid from our list, we can consider it valid
-    if (result.domainValid) {
-      result.status = 'valid';
-      result.recheckNeeded = false;
       return result;
+    } catch (error) {
+      console.error('VALIDATION_TIMEOUT:', { message: error.message, email });
+      console.log('VALIDATION_PROCESS: Using quick validation result as fallback due to timeout');
+      // Return quick result on timeout
+      return quickResult;
     }
-    
-    // Step 4: If enabled and not skipped, check with ZeroBounce
-    if (this.config.useZeroBounce !== false && !skipZeroBounce) {
-      try {
-        const bounceCheck = await this.checkWithZeroBounce(correctedEmail);
-        
-        result.status = bounceCheck.status;
-        result.subStatus = bounceCheck.subStatus;
-        result.recheckNeeded = bounceCheck.recheckNeeded;
-        result.validationSteps.push({
-          step: 'zerobounce_check',
-          result: bounceCheck
-        });
-      } catch (error) {
-        console.error('VALIDATION_PROCESS: ZeroBounce check failed', {
-          message: error.message
-        });
-        
-        // Continue with validation but mark as check_failed
-        result.status = 'check_failed';
-        result.recheckNeeded = true;
-        result.validationSteps.push({
-          step: 'zerobounce_check',
-          error: error.message
-        });
-      }
-    } else {
-      console.log('VALIDATION_PROCESS: ZeroBounce check skipped');
-      result.validationSteps.push({
-        step: 'zerobounce_check',
-        skipped: true
-      });
-      
-      // Without ZeroBounce, rely on domain check
-      result.status = 'unknown';
-      result.recheckNeeded = true;
-    }
-    
-    return result;
   }
   
-  // Process a batch of emails with better timeout handling
+  // Batch validation with time budget management
   async validateBatch(emails, options = {}) {
-    const { skipZeroBounce = false, timeoutPerEmailMs = 3000 } = options;
+    const { skipZeroBounce = false, timeoutPerEmailMs = 2000 } = options;
     
-    console.log('BATCH_VALIDATION: Starting batch validation', { 
-      totalEmails: emails.length,
-      skipZeroBounce,
-      timeoutPerEmailMs
-    });
-
     const results = [];
+    const batchStartTime = Date.now();
+    const totalBatchTimeoutMs = Math.min(5000, emails.length * timeoutPerEmailMs);
     
-    // Set a maximum time budget for the entire batch
-    const maxBatchTimeMs = Math.min(9000, emails.length * timeoutPerEmailMs);
-    const batchEndTime = Date.now() + maxBatchTimeMs;
-    
-    for (const email of emails) {
-      try {
-        // Calculate remaining time for this email
-        const remainingTime = batchEndTime - Date.now();
-        if (remainingTime <= 0) {
-          console.warn('BATCH_VALIDATION: Time budget exceeded, using quick validation for remaining emails');
-          // Use quick validation for remaining emails
-          results.push(this.quickValidate(email));
-          continue;
+    for (let i = 0; i < emails.length; i++) {
+      const email = emails[i];
+      
+      // Calculate remaining time budget
+      const elapsedTime = Date.now() - batchStartTime;
+      const remainingTimeMs = totalBatchTimeoutMs - elapsedTime;
+      
+      // If we're running out of time, use quick validation for remaining emails
+      if (remainingTimeMs < timeoutPerEmailMs / 2) {
+        // Process remaining emails with quick validation
+        for (let j = i; j < emails.length; j++) {
+          results.push(this.quickValidate(emails[j]));
         }
-        
-        console.log('BATCH_VALIDATION: Validating email with remaining time', { 
-          email, 
-          remainingTimeMs: remainingTime 
-        });
-        
+        break;
+      }
+      
+      try {
         // Validate with appropriate timeout
         const result = await this.validateEmail(email, {
           skipZeroBounce,
-          timeoutMs: Math.min(remainingTime, timeoutPerEmailMs)
+          timeoutMs: Math.min(remainingTimeMs, timeoutPerEmailMs)
         });
         
         results.push(result);
       } catch (error) {
-        console.error('BATCH_VALIDATION: Error validating email', {
-          email,
-          message: error.message
-        });
-        
-        // Fall back to quick validation on error
+        // Fall back to quick validation
         results.push(this.quickValidate(email));
       }
     }
     
-    console.log('BATCH_VALIDATION: Batch validation complete', { 
-      totalProcessed: results.length 
-    });
-    
     return results;
   }
   
-  // Update HubSpot contact with improved error handling and logging
+  // Update HubSpot contact with proper timeout handling
   async updateHubSpotContact(contactId, validationResult) {
-    console.log('HUBSPOT_UPDATE: Starting contact update', { 
-      contactId, 
+    console.log('HUBSPOT_UPDATE: Starting contact update', {
+      contactId,
       validationStatus: validationResult.status,
-      currentEmail: validationResult.currentEmail
+      email: validationResult.currentEmail
     });
+    
+    if (!this.config.hubspot?.apiKey) {
+      console.error('HUBSPOT_UPDATE: API key not configured');
+      return {
+        success: false,
+        contactId,
+        error: 'HubSpot API key not configured'
+      };
+    }
 
     try {
-      // Validate HubSpot configuration
-      if (!this.config.hubspot || !this.config.hubspot.apiKey) {
-        console.error('HUBSPOT_UPDATE_ERROR: API key not configured');
-        return {
-          success: false,
-          contactId,
-          error: 'HubSpot API key not configured'
-        };
-      }
+      console.log('HUBSPOT_UPDATE: Preparing properties for update');
       
-      // Prepare properties to update
-      const properties = {
-        email: validationResult.currentEmail,
-        email_status: validationResult.status,
-        email_recheck_needed: validationResult.recheckNeeded,
-        email_check_date: new Date().toISOString(),
-      };
-      
-      // Add additional properties if email was corrected
-      if (validationResult.wasCorrected) {
-        properties.original_email = validationResult.originalEmail;
-        properties.email_corrected = true;
-      }
-      
-      // Add sub-status if present
-      if (validationResult.subStatus) {
-        properties.email_sub_status = validationResult.subStatus;
-      }
-      
-      // Prepare fetch options
-      const fetchOptions = {
-        method: 'PATCH',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${this.config.hubspot.apiKey}`
-        },
-        body: JSON.stringify({ properties })
-      };
-
-      console.log('HUBSPOT_UPDATE: Sending update request', { 
-        contactId, 
-        properties: Object.keys(properties),
-        requestBody: JSON.stringify({ properties })
-      });
-
-      // Use configured timeout for HubSpot
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => {
-        console.log('HUBSPOT_UPDATE: Aborting request due to timeout');
-        controller.abort();
-      }, this.timeouts.hubspot);
-      
-      try {
-        // Log the full request details for debugging
-        console.log('HUBSPOT_UPDATE: Request details', {
-          url: `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}`,
-          method: 'PATCH',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': 'Bearer [REDACTED]'
-          },
-          body: JSON.stringify({ properties })
-        });
-        
-        // Send update request with abort signal
-        const response = await fetch(
-          `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}`,
-          { ...fetchOptions, signal: controller.signal }
-        );
-        clearTimeout(timeoutId);
-        
-        // Log the response status for debugging
-        console.log('HUBSPOT_UPDATE: Response status', {
-          status: response.status,
-          statusText: response.statusText
-        });
-        
-        // Check response
-        if (!response.ok) {
-          const errorBody = await response.text();
-          console.error('HUBSPOT_UPDATE_ERROR: API response not OK', {
-            status: response.status,
-            statusText: response.statusText,
-            errorBody
+      return await this.withTimeout(
+        async (signal) => {
+          // Prepare properties to update
+          const properties = {
+            email: validationResult.currentEmail,
+            email_status: validationResult.status,
+            email_recheck_needed: validationResult.recheckNeeded,
+            email_check_date: new Date().toISOString(),
+          };
+          
+          if (validationResult.wasCorrected) {
+            properties.original_email = validationResult.originalEmail;
+            properties.email_corrected = true;
+          }
+          
+          if (validationResult.subStatus) {
+            properties.email_sub_status = validationResult.subStatus;
+          }
+          
+          console.log('HUBSPOT_UPDATE: Sending update request', {
+            contactId,
+            properties: Object.keys(properties).join(', ')
           });
-          throw new Error(`HubSpot API error: ${response.status} ${response.statusText}`);
-        }
-        
-        // Parse and log successful response
-        const data = await response.json();
-        console.log('HUBSPOT_UPDATE: Update successful', { 
-          contactId, 
-          responseId: data.id,
-          responseData: JSON.stringify(data).substring(0, 200)
-        });
-        
-        return {
-          success: true,
-          contactId,
-          hubspotResponse: data
-        };
-      } catch (error) {
-        clearTimeout(timeoutId);
-        throw error;
-      }
+          
+          // Send update request
+          const response = await fetch(
+            `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}`,
+            {
+              method: 'PATCH',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${this.config.hubspot.apiKey}`
+              },
+              body: JSON.stringify({ properties }),
+              signal
+            }
+          );
+          
+          console.log('HUBSPOT_UPDATE: Received response', {
+            contactId,
+            status: response.status,
+            statusText: response.statusText
+          });
+          
+          if (!response.ok) {
+            throw new Error(`HubSpot API error: ${response.status} ${response.statusText}`);
+          }
+          
+          const data = await response.json();
+          
+          console.log('HUBSPOT_UPDATE: Successfully updated contact', {
+            contactId,
+            responseId: data.id
+          });
+          
+          return {
+            success: true,
+            contactId,
+            hubspotResponse: data
+          };
+        },
+        this.timeouts.hubspot,
+        'HubSpot update timeout'
+      );
     } catch (error) {
-      console.error('HUBSPOT_UPDATE_FATAL_ERROR:', {
-        contactId,
-        message: error.message,
-        name: error.name,
-        stack: error.stack
-      });
-      
-      // Special handling for AbortError (timeout)
-      if (error.name === 'AbortError') {
-        return {
-          success: false,
-          contactId,
-          error: 'HubSpot API request timed out'
-        };
-      }
-      
+      console.error('HUBSPOT_UPDATE_ERROR:', { message: error.message, contactId });
       return {
         success: false,
         contactId,
