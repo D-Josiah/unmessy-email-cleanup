@@ -112,7 +112,11 @@ export class EmailValidationService {
         async (signal) => {
           const key = `email:${email}`;
           console.log('REDIS_CHECK: Attempting to check if email exists in Redis', { email, key });
-          const result = await this.redis.get(key, { signal });
+          
+          // Important: Redis.get() doesn't accept a signal parameter directly
+          // We need to use the abort controller but not pass it to the get method
+          const result = await this.redis.get(key);
+          
           const found = !!result;
           console.log('REDIS_CHECK: Completed successfully', { 
             email, 
