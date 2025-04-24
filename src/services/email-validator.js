@@ -279,7 +279,7 @@ export class EmailValidationService {
     };
   }
   
-  // ZeroBounce check with proper timeout handling
+  // ZeroBounce check with proper timeout handling and did_you_mean handling
   async checkWithZeroBounce(email) {
     if (!this.config.zeroBounceApiKey || this.config.useZeroBounce === false) {
       console.log('ZEROBOUNCE_CHECK: ZeroBounce not configured or disabled, skipping check');
@@ -317,11 +317,21 @@ export class EmailValidationService {
           console.log('ZEROBOUNCE_CHECK: Received response from ZeroBounce API', { 
             email,
             status: result.status,
-            subStatus: result.sub_status
+            subStatus: result.sub_status,
+            didYouMean: result.did_you_mean || null
           });
           
           // Map ZeroBounce status to our status
-          let status, subStatus, recheckNeeded;
+          let status, subStatus, recheckNeeded, suggestedEmail = null;
+          
+          // Check for "did_you_mean" suggestions
+          if (result.did_you_mean) {
+            console.log('ZEROBOUNCE_CHECK: Found email suggestion from ZeroBounce', {
+              original: email,
+              suggested: result.did_you_mean
+            });
+            suggestedEmail = result.did_you_mean;
+          }
           
           switch (result.status) {
             case 'valid':
@@ -357,7 +367,8 @@ export class EmailValidationService {
             email, 
             status, 
             subStatus,
-            recheckNeeded
+            recheckNeeded,
+            suggestedEmail
           });
           
           // If valid, try to add to Redis in background (don't await)
@@ -370,6 +381,7 @@ export class EmailValidationService {
             status,
             subStatus,
             recheckNeeded,
+            suggestedEmail,  // Include suggested email in the result
             source: 'zerobounce',
             details: result
           };
@@ -393,12 +405,13 @@ export class EmailValidationService {
   
   // Main validation with proper timeout and graceful fallback
   async validateEmail(email, options = {}) {
-    const { skipZeroBounce = false, timeoutMs = this.timeouts.validation } = options;
+    const { skipZeroBounce = false, timeoutMs = this.timeouts.validation, isRetry = false } = options;
     
     console.log('VALIDATION_PROCESS: Starting validation for email', { 
       email, 
       skipZeroBounce, 
-      timeoutMs 
+      timeoutMs,
+      isRetry
     });
     
     // Start with quick validation (synchronous, always works)
@@ -453,17 +466,51 @@ export class EmailValidationService {
             });
           }
           
-          // Add ZeroBounce result if available and successful
+          // Check ZeroBounce result and process any suggested email
           if (!skipZeroBounce && zeroBounceResult?.status === 'fulfilled' && zeroBounceResult.value) {
             const bounceCheck = zeroBounceResult.value;
             
             console.log('VALIDATION_PROCESS: ZeroBounce check completed', {
               email: quickResult.currentEmail,
               status: bounceCheck.status,
-              subStatus: bounceCheck.subStatus
+              subStatus: bounceCheck.subStatus,
+              suggestedEmail: bounceCheck.suggestedEmail
             });
             
-            // Only update if we got a definitive result
+            // Check for suggested email from ZeroBounce
+            if (bounceCheck.suggestedEmail && !isRetry) {
+              console.log('VALIDATION_PROCESS: ZeroBounce suggested an email correction, revalidating', {
+                originalEmail: email,
+                suggestedEmail: bounceCheck.suggestedEmail
+              });
+              
+              // Recursive call with the suggested email, but mark as a retry to prevent infinite loops
+              const suggestedEmailResult = await this.validateEmail(bounceCheck.suggestedEmail, {
+                skipZeroBounce: false,  // Always check with ZeroBounce for the suggested email
+                timeoutMs: timeoutMs * 0.8,  // Reduce timeout for the retry to ensure we don't exceed the original
+                isRetry: true  // Mark this as a retry to prevent infinite loops
+              });
+              
+              // Add information about the suggestion to the result
+              suggestedEmailResult.originalEmail = email;
+              suggestedEmailResult.wasCorrected = true;
+              suggestedEmailResult.validationSteps.push({
+                step: 'zerobounce_suggestion',
+                original: email,
+                suggested: bounceCheck.suggestedEmail,
+                result: suggestedEmailResult.status
+              });
+              
+              console.log('VALIDATION_PROCESS: Completed validation with ZeroBounce suggestion', {
+                originalEmail: email,
+                suggestedEmail: bounceCheck.suggestedEmail,
+                finalStatus: suggestedEmailResult.status
+              });
+              
+              return suggestedEmailResult;
+            }
+            
+            // Only update if we got a definitive result or no suggested email was available
             if (bounceCheck.status === 'valid' || bounceCheck.status === 'invalid') {
               result.status = bounceCheck.status;
               result.subStatus = bounceCheck.subStatus;
@@ -578,9 +625,26 @@ export class EmailValidationService {
             email_check_date: new Date().toISOString(),
           };
           
+          // Add original email if corrected (either by built-in corrections or ZeroBounce suggestion)
           if (validationResult.wasCorrected) {
             properties.original_email = validationResult.originalEmail;
             properties.email_corrected = true;
+            
+            // If correction was due to ZeroBounce suggestion, add that info
+            if (validationResult.validationSteps?.some(step => step.step === 'zerobounce_suggestion')) {
+              properties.email_correction_source = 'zerobounce';
+              
+              const suggestionStep = validationResult.validationSteps?.find(
+                step => step.step === 'zerobounce_suggestion'
+              );
+              
+              if (suggestionStep) {
+                properties.email_suggested_by_zerobounce = true;
+                properties.email_suggestion_original = suggestionStep.original;
+              }
+            } else {
+              properties.email_correction_source = 'internal';
+            }
           }
           
           if (validationResult.subStatus) {
