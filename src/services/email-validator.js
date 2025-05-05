@@ -1,39 +1,39 @@
-import { Redis } from '@upstash/redis';
+import { createClient } from '@supabase/supabase-js';
 
 export class EmailValidationService {
   constructor(config) {
     this.config = config;
     
-    // Initialize Redis by default unless explicitly disabled
-    this.redis = null;
-    this.redisEnabled = !!(config.upstash && 
-                           config.upstash.url && 
-                           config.upstash.token &&
-                           config.useRedis !== false);
+    // Initialize Supabase
+    this.supabase = null;
+    this.supabaseEnabled = !!(config.supabase && 
+                             config.supabase.url && 
+                             config.supabase.key &&
+                             config.useSupabase !== false);
     
     // Timeouts configuration with defaults - shorter timeouts to prevent HubSpot flow hanging
     this.timeouts = {
-      redis: config.timeouts?.redis || 1500,
+      supabase: config.timeouts?.supabase || 1500,
       zeroBounce: config.timeouts?.zeroBounce || 3000,
       hubspot: config.timeouts?.hubspot || 5000,
       validation: config.timeouts?.validation || 4000, 
       webhook: config.timeouts?.webhook || 6000
     };
 
-    // Initialize Redis asynchronously, don't block main operations
-    if (this.redisEnabled) {
+    // Initialize Supabase client
+    if (this.supabaseEnabled) {
       try {
-        console.log('UPSTASH_INIT: Initializing Redis client');
-        this.redis = new Redis({
-          url: config.upstash.url,
-          token: config.upstash.token,
-        });
+        console.log('SUPABASE_INIT: Initializing Supabase client');
+        this.supabase = createClient(
+          config.supabase.url,
+          config.supabase.key
+        );
         
         // Test connection in background without blocking
-        this._testRedisConnectionAsync();
+        this._testSupabaseConnectionAsync();
       } catch (error) {
-        console.error('UPSTASH_INIT_ERROR:', { message: error.message });
-        // Still keep Redis enabled for future attempts
+        console.error('SUPABASE_INIT_ERROR:', { message: error.message });
+        // Still keep Supabase enabled for future attempts
       }
     }
     
@@ -61,21 +61,36 @@ export class EmailValidationService {
       'yandex.com', 'gmx.com', 'live.com', 'msn.com', 'me.com', 'mac.com', 
       'googlemail.com', 'pm.me', 'tutanota.com', 'mailbox.org'
     ];
+    
+    // Client ID for um_check_id generation
+    this.clientId = config.clientId || '00001';
+    this.umessyVersion = config.umessyVersion || '100';
   }
 
   // Asynchronous test without blocking operations
-  async _testRedisConnectionAsync() {
-    if (!this.redis) return;
+  async _testSupabaseConnectionAsync() {
+    if (!this.supabase) return;
     
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), this.timeouts.redis);
+      const timeoutId = setTimeout(() => controller.abort(), this.timeouts.supabase);
       
-      const pingResult = await this.redis.ping({ signal: controller.signal });
+      // Try a simple query to test the connection
+      const { data, error } = await this.supabase
+        .from('contacts')
+        .select('id')
+        .limit(1)
+        .abortSignal(controller.signal);
+        
       clearTimeout(timeoutId);
-      console.log('UPSTASH_CONNECTION_TEST: Ping successful', { result: pingResult });
+      
+      if (error) {
+        throw error;
+      }
+      
+      console.log('SUPABASE_CONNECTION_TEST: Test query successful');
     } catch (error) {
-      console.error('UPSTASH_CONNECTION_TEST_FAILED:', { message: error.message });
+      console.error('SUPABASE_CONNECTION_TEST_FAILED:', { message: error.message });
       // Non-blocking - just log the error
     }
   }
@@ -99,10 +114,24 @@ export class EmailValidationService {
     }
   }
   
-  // Non-blocking Redis check - doesn't throw, returns false on failure
+  // Generate um_check_id based on specification
+  generateUmCheckId() {
+    const epochTime = Math.floor(Date.now() / 1000);
+    const lastSixDigits = String(epochTime).slice(-6);
+    
+    // Calculate check digit
+    const firstThreeDigits = String(epochTime).slice(0, 3);
+    const sum = [...firstThreeDigits].reduce((acc, digit) => acc + parseInt(digit), 0);
+    const checkDigit = String(sum * parseInt(this.clientId)).padStart(3, '0');
+    
+    // Format: lastSixDigits + clientId + checkDigit + version
+    return `${lastSixDigits}${this.clientId}${checkDigit}${this.umessyVersion}`;
+  }
+  
+  // Non-blocking Supabase check - doesn't throw, returns false on failure
   async isKnownValidEmail(email) {
-    if (!this.redisEnabled || !this.redis) {
-      console.log('REDIS_CHECK: Redis not enabled, skipping check');
+    if (!this.supabaseEnabled || !this.supabase) {
+      console.log('SUPABASE_CHECK: Supabase not enabled, skipping check');
       return false;
     }
 
@@ -110,67 +139,174 @@ export class EmailValidationService {
       // Use AbortController and timeout
       const result = await this.withTimeout(
         async (signal) => {
-          const key = `email:${email}`;
-          console.log('REDIS_CHECK: Attempting to check if email exists in Redis', { email, key });
+          console.log('SUPABASE_CHECK: Attempting to check if email exists in Supabase', { email });
           
-          // Important: Redis.get() doesn't accept a signal parameter directly
-          // We need to use the abort controller but not pass it to the get method
-          const result = await this.redis.get(key);
+          const { data, error } = await this.supabase
+            .from('email_validations')
+            .select('email, um_email_status')
+            .eq('email', email)
+            .abortSignal(signal)
+            .single();
           
-          const found = !!result;
-          console.log('REDIS_CHECK: Completed successfully', { 
+          if (error && error.code !== 'PGRST116') { // PGRST116 is "No rows returned" error
+            throw error;
+          }
+          
+          const found = !!data;
+          console.log('SUPABASE_CHECK: Completed successfully', { 
             email, 
             found, 
-            resultType: typeof result 
+            status: data?.um_email_status || null
           });
-          return found;
+          
+          return {
+            found,
+            data
+          };
         },
-        this.timeouts.redis,
-        'Redis check timeout'
+        this.timeouts.supabase,
+        'Supabase check timeout'
       );
       
-      if (result) {
-        console.log('REDIS_CHECK: Email found in Redis database', { email });
+      if (result.found) {
+        console.log('SUPABASE_CHECK: Email found in Supabase database', { email });
       } else {
-        console.log('REDIS_CHECK: Email not found in Redis database', { email });
+        console.log('SUPABASE_CHECK: Email not found in Supabase database', { email });
       }
       
       return result;
     } catch (error) {
-      console.error('REDIS_GET_ERROR:', { message: error.message, email });
-      return false; // Continue validation on failure
+      console.error('SUPABASE_GET_ERROR:', { message: error.message, email });
+      return { found: false }; // Continue validation on failure
     }
   }
   
-  // Non-blocking Redis add - doesn't throw, returns false on failure
-  async addToKnownValidEmails(email) {
-    if (!this.redisEnabled || !this.redis) {
+  // Save validation result to Supabase
+  async saveValidationResult(originalEmail, validationResult) {
+    if (!this.supabaseEnabled || !this.supabase) {
+      console.log('SUPABASE_SAVE: Supabase not enabled, skipping save');
       return false;
     }
 
     try {
       return await this.withTimeout(
         async (signal) => {
-          const key = `email:${email}`;
-          const data = {
-            validatedAt: new Date().toISOString(),
-            source: 'validation-service'
+          // Create a check ID for this validation
+          const umCheckId = this.generateUmCheckId();
+          const now = new Date();
+          
+          // Map validation status to um_email_status and um_bounce_status
+          let umEmailStatus = 'Unable to change';
+          let umBounceStatus = 'Unknown';
+          
+          if (validationResult.wasCorrected) {
+            umEmailStatus = 'Changed';
+          } else {
+            umEmailStatus = 'Unchanged';
+          }
+          
+          if (validationResult.status === 'valid') {
+            umBounceStatus = 'Unlikely to bounce';
+          } else if (validationResult.status === 'invalid') {
+            umBounceStatus = 'Likely to bounce';
+          }
+          
+          // First, check if we need to create a contact
+          let contactId;
+          
+          // Look for existing contact with this email
+          const { data: existingContact, error: contactLookupError } = await this.supabase
+            .from('email_validations')
+            .select('contact_id')
+            .eq('email', originalEmail)
+            .abortSignal(signal)
+            .single();
+            
+          if (existingContact) {
+            contactId = existingContact.contact_id;
+          } else {
+            // Create new contact
+            const { data: newContact, error: createContactError } = await this.supabase
+              .from('contacts')
+              .insert({})
+              .select('id')
+              .abortSignal(signal)
+              .single();
+              
+            if (createContactError) {
+              throw new Error(`Failed to create contact: ${createContactError.message}`);
+            }
+            
+            contactId = newContact.id;
+          }
+          
+          // Now insert or update the email validation record
+          const validationData = {
+            contact_id: contactId,
+            date_last_um_check: now.toISOString(),
+            date_last_um_check_epoch: Math.floor(now.getTime() / 1000),
+            um_check_id: umCheckId,
+            um_email: validationResult.currentEmail,
+            email: originalEmail,
+            um_email_status: umEmailStatus,
+            um_bounce_status: umBounceStatus
           };
           
-          const setResult = await this.redis.set(
-            key, 
-            JSON.stringify(data), 
-            { ex: 30 * 24 * 60 * 60, signal }
-          );
+          // Check if record already exists for this email
+          const { data: existingValidation, error: validationLookupError } = await this.supabase
+            .from('email_validations')
+            .select('id')
+            .eq('email', originalEmail)
+            .abortSignal(signal)
+            .single();
+            
+          let result;
           
-          return setResult === 'OK';
+          if (existingValidation) {
+            // Update existing record
+            const { data, error } = await this.supabase
+              .from('email_validations')
+              .update(validationData)
+              .eq('id', existingValidation.id)
+              .select()
+              .abortSignal(signal)
+              .single();
+              
+            if (error) {
+              throw new Error(`Failed to update validation record: ${error.message}`);
+            }
+            
+            result = { success: true, operation: 'update', data };
+          } else {
+            // Insert new record
+            const { data, error } = await this.supabase
+              .from('email_validations')
+              .insert(validationData)
+              .select()
+              .abortSignal(signal)
+              .single();
+              
+            if (error) {
+              throw new Error(`Failed to insert validation record: ${error.message}`);
+            }
+            
+            result = { success: true, operation: 'insert', data };
+          }
+          
+          console.log('SUPABASE_SAVE: Successfully saved validation result', {
+            email: originalEmail,
+            operation: result.operation,
+            id: result.data.id
+          });
+          
+          return result;
         },
-        this.timeouts.redis,
-        'Redis add timeout'
+        this.timeouts.supabase,
+        'Supabase save timeout'
       );
     } catch (error) {
-      console.error('REDIS_ADD_ERROR:', { message: error.message, email });
-      return false; // Don't let Redis failures block
+      console.error('SUPABASE_SAVE_ERROR:', { message: error.message, email: originalEmail });
+      return { success: false, error: error.message };
     }
   }
   
@@ -263,6 +399,14 @@ export class EmailValidationService {
     const domainValid = this.isValidDomain(correctedEmail);
     const status = domainValid ? 'valid' : 'unknown';
     
+    // Generate um_check_id
+    const umCheckId = this.generateUmCheckId();
+    const now = new Date();
+    
+    // Determine Unmessy statuses
+    const umEmailStatus = corrected ? 'Changed' : 'Unchanged';
+    const umBounceStatus = domainValid ? 'Unlikely to bounce' : 'Unknown';
+    
     return {
       originalEmail: email,
       currentEmail: correctedEmail,
@@ -275,7 +419,15 @@ export class EmailValidationService {
         { step: 'format_check', passed: true },
         { step: 'typo_correction', applied: corrected, original: email, corrected: correctedEmail },
         { step: 'domain_check', passed: domainValid }
-      ]
+      ],
+      // Add unmessy specific fields
+      date_last_um_check: now.toISOString(),
+      date_last_um_check_epoch: Math.floor(now.getTime() / 1000),
+      um_check_id: umCheckId,
+      um_email: correctedEmail,
+      email: email,
+      um_email_status: umEmailStatus,
+      um_bounce_status: umBounceStatus
     };
   }
   
@@ -324,6 +476,10 @@ export class EmailValidationService {
           // Map ZeroBounce status to our status
           let status, subStatus, recheckNeeded, suggestedEmail = null;
           
+          // Generate unmessy fields
+          const umCheckId = this.generateUmCheckId();
+          const now = new Date();
+          
           // Check for "did_you_mean" suggestions
           if (result.did_you_mean) {
             console.log('ZEROBOUNCE_CHECK: Found email suggestion from ZeroBounce', {
@@ -333,15 +489,21 @@ export class EmailValidationService {
             suggestedEmail = result.did_you_mean;
           }
           
+          // Map status and determine unmessy statuses
+          let umEmailStatus = suggestedEmail ? 'Changed' : 'Unchanged';
+          let umBounceStatus = 'Unknown';
+          
           switch (result.status) {
             case 'valid':
               status = 'valid';
               recheckNeeded = false;
+              umBounceStatus = 'Unlikely to bounce';
               break;
             case 'invalid':
               status = 'invalid';
               subStatus = result.sub_status;
               recheckNeeded = false;
+              umBounceStatus = 'Likely to bounce';
               break;
             case 'catch-all':
             case 'unknown':
@@ -352,11 +514,13 @@ export class EmailValidationService {
               status = 'invalid';
               subStatus = 'spamtrap';
               recheckNeeded = false;
+              umBounceStatus = 'Likely to bounce';
               break;
             case 'abuse':
               status = 'invalid';
               subStatus = 'abuse';
               recheckNeeded = false;
+              umBounceStatus = 'Likely to bounce';
               break;
             default:
               status = 'check_failed';
@@ -371,9 +535,14 @@ export class EmailValidationService {
             suggestedEmail
           });
           
-          // If valid, try to add to Redis in background (don't await)
+          // If valid, try to save to Supabase in background (don't await)
           if (status === 'valid') {
-            this.addToKnownValidEmails(email).catch(() => {});
+            this.saveValidationResult(email, {
+              currentEmail: suggestedEmail || email,
+              wasCorrected: !!suggestedEmail,
+              status,
+              recheckNeeded
+            }).catch(() => {});
           }
           
           return {
@@ -381,9 +550,17 @@ export class EmailValidationService {
             status,
             subStatus,
             recheckNeeded,
-            suggestedEmail,  // Include suggested email in the result
+            suggestedEmail,
             source: 'zerobounce',
-            details: result
+            details: result,
+            // Add unmessy specific fields
+            date_last_um_check: now.toISOString(),
+            date_last_um_check_epoch: Math.floor(now.getTime() / 1000),
+            um_check_id: umCheckId,
+            um_email: suggestedEmail || email,
+            email: email,
+            um_email_status: umEmailStatus,
+            um_bounce_status: umBounceStatus
           };
         },
         this.timeouts.zeroBounce,
@@ -430,10 +607,10 @@ export class EmailValidationService {
       const result = await this.withTimeout(
         async () => {
           // Log the process
-          console.log('VALIDATION_PROCESS: Running Redis and ZeroBounce checks in parallel');
+          console.log('VALIDATION_PROCESS: Running Supabase and ZeroBounce checks in parallel');
           
-          // Run Redis check and ZeroBounce check in parallel
-          const [isKnownValid, zeroBounceResult] = await Promise.allSettled([
+          // Run Supabase check and ZeroBounce check in parallel
+          const [knownValidResult, zeroBounceResult] = await Promise.allSettled([
             this.isKnownValidEmail(quickResult.currentEmail),
             skipZeroBounce ? null : this.checkWithZeroBounce(quickResult.currentEmail)
           ]);
@@ -441,28 +618,47 @@ export class EmailValidationService {
           // Start with the quick result and enhance it
           const result = { ...quickResult };
           
-          // Add Redis result if successful
-          if (isKnownValid.status === 'fulfilled' && isKnownValid.value === true) {
-            console.log('VALIDATION_PROCESS: Email found in Redis database, marking as valid', { 
+          // Add Supabase result if successful
+          if (knownValidResult.status === 'fulfilled' && knownValidResult.value.found) {
+            console.log('VALIDATION_PROCESS: Email found in Supabase database, marking as valid', { 
               email: quickResult.currentEmail 
             });
             
-            result.isKnownValid = true;
-            result.status = 'valid';
-            result.recheckNeeded = false;
+            const validationData = knownValidResult.value.data;
+            
+            // Update the result with data from the database
+            if (validationData) {
+              result.isKnownValid = true;
+              result.status = validationData.um_bounce_status === 'Unlikely to bounce' ? 'valid' : 'invalid';
+              result.recheckNeeded = false;
+              
+              // Include the stored Supabase data in the result
+              Object.assign(result, {
+                um_email_status: validationData.um_email_status,
+                um_bounce_status: validationData.um_bounce_status,
+                date_last_um_check: validationData.date_last_um_check,
+                date_last_um_check_epoch: validationData.date_last_um_check_epoch,
+                um_check_id: validationData.um_check_id
+              });
+            }
+            
             result.validationSteps.push({ step: 'known_valid_check', passed: true });
-            return result;
+            
+            // If we already have a recent validation, we can return early
+            if (validationData && Date.now() - (validationData.date_last_um_check_epoch * 1000) < 7 * 24 * 60 * 60 * 1000) {
+              return result;
+            }
           } else {
-            console.log('VALIDATION_PROCESS: Email not found in Redis or check failed', {
+            console.log('VALIDATION_PROCESS: Email not found in Supabase or check failed', {
               email: quickResult.currentEmail,
-              status: isKnownValid.status
+              status: knownValidResult.status
             });
             
             result.isKnownValid = false;
             result.validationSteps.push({ 
               step: 'known_valid_check', 
               passed: false, 
-              error: isKnownValid.status === 'rejected' ? isKnownValid.reason.message : null 
+              error: knownValidResult.status === 'rejected' ? knownValidResult.reason.message : null 
             });
           }
           
@@ -501,11 +697,18 @@ export class EmailValidationService {
                 result: suggestedEmailResult.status
               });
               
+              // Update unmessy fields
+              suggestedEmailResult.um_email_status = 'Changed';
+              suggestedEmailResult.email = email;
+              
               console.log('VALIDATION_PROCESS: Completed validation with ZeroBounce suggestion', {
                 originalEmail: email,
                 suggestedEmail: bounceCheck.suggestedEmail,
                 finalStatus: suggestedEmailResult.status
               });
+              
+              // Save validation result to Supabase
+              this.saveValidationResult(email, suggestedEmailResult).catch(() => {});
               
               return suggestedEmailResult;
             }
@@ -515,6 +718,12 @@ export class EmailValidationService {
               result.status = bounceCheck.status;
               result.subStatus = bounceCheck.subStatus;
               result.recheckNeeded = bounceCheck.recheckNeeded;
+              
+              // Update unmessy fields from ZeroBounce results
+              result.um_bounce_status = bounceCheck.um_bounce_status;
+              result.um_check_id = bounceCheck.um_check_id;
+              result.date_last_um_check = bounceCheck.date_last_um_check;
+              result.date_last_um_check_epoch = bounceCheck.date_last_um_check_epoch;
             }
             
             result.validationSteps.push({
@@ -539,6 +748,9 @@ export class EmailValidationService {
             recheckNeeded: result.recheckNeeded
           });
           
+          // Save validation result to Supabase
+          this.saveValidationResult(email, result).catch(() => {});
+          
           return result;
         },
         timeoutMs,
@@ -549,6 +761,10 @@ export class EmailValidationService {
     } catch (error) {
       console.error('VALIDATION_TIMEOUT:', { message: error.message, email });
       console.log('VALIDATION_PROCESS: Using quick validation result as fallback due to timeout');
+      
+      // Save quick result to Supabase
+      this.saveValidationResult(email, quickResult).catch(() => {});
+      
       // Return quick result on timeout
       return quickResult;
     }
@@ -623,6 +839,12 @@ export class EmailValidationService {
             email_status: validationResult.status,
             email_recheck_needed: validationResult.recheckNeeded,
             email_check_date: new Date().toISOString(),
+            
+            // Include Unmessy specific fields
+            um_email_status: validationResult.um_email_status,
+            um_bounce_status: validationResult.um_bounce_status,
+            date_last_um_check: validationResult.date_last_um_check,
+            um_check_id: validationResult.um_check_id
           };
           
           // Add original email if corrected (either by built-in corrections or ZeroBounce suggestion)

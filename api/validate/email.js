@@ -1,17 +1,21 @@
 import { EmailValidationService } from '../../src/services/email-validator.js';
 
-// Load configuration with Redis disabled by default to ensure reliability
+// Load configuration with Supabase enabled by default
 const config = {
   useZeroBounce: process.env.USE_ZERO_BOUNCE === 'true',
   zeroBounceApiKey: process.env.ZERO_BOUNCE_API_KEY || '',
   removeGmailAliases: true,
   checkAustralianTlds: true,
-  // Use Redis only when explicitly enabled by environment variable
-  useRedis: process.env.USE_REDIS === 'true',
-  upstash: {
-    url: process.env.UPSTASH_REDIS_URL || '',
-    token: process.env.UPSTASH_REDIS_TOKEN || ''
-  }
+  // Use Supabase for persistence
+  useSupabase: process.env.USE_SUPABASE !== 'false', // Enabled by default
+  supabase: {
+    url: process.env.SUPABASE_URL || 'https://noxlrexfrmakvnfqhxfx.supabase.co',
+    key: process.env.SUPABASE_SERVICE_ROLE_KEY || ''
+  },
+  // Optional: Client ID for um_check_id generation
+  clientId: process.env.CLIENT_ID || '00001',
+  // Unmessy version number
+  umessyVersion: process.env.UMESSY_VERSION || '100'
 };
 
 // Initialize the email validation service
@@ -43,13 +47,26 @@ export default async function handler(req, res) {
     // First do a quick format check - if invalid, return immediately
     if (!emailValidator.isValidEmailFormat(email)) {
       console.log('Quick validation: Invalid email format');
+      
+      // Generate unmessy fields for invalid format
+      const now = new Date();
+      const umCheckId = emailValidator.generateUmCheckId();
+      
       return res.status(200).json({
         originalEmail: email,
         currentEmail: email,
         formatValid: false,
         status: 'invalid',
         subStatus: 'bad_format',
-        recheckNeeded: false
+        recheckNeeded: false,
+        // Add unmessy specific fields
+        date_last_um_check: now.toISOString(),
+        date_last_um_check_epoch: Math.floor(now.getTime() / 1000),
+        um_check_id: umCheckId,
+        um_email: email,
+        email: email,
+        um_email_status: 'Unable to change',
+        um_bounce_status: 'Likely to bounce'
       });
     }
     
