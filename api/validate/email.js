@@ -1,4 +1,6 @@
+// api/validate/email.js
 import { EmailValidationService } from '../../src/services/email-validator.js';
+import { ClientManagerService } from '../../src/services/client-manager.js';
 import dotenv from 'dotenv';
 
 // Load environment variables
@@ -6,29 +8,8 @@ dotenv.config();
 
 // Detailed logging for configuration and connection status
 console.log('=============================================');
-console.log('EMAIL VALIDATION API STARTUP - FIXED VERSION');
+console.log('EMAIL VALIDATION API STARTUP - CLIENT AUTH ENABLED');
 console.log('=============================================');
-
-// Log environment variables (safely)
-console.log('ENVIRONMENT VARIABLES CHECK:', {
-  supabaseUrlSet: !!process.env.SUPABASE_URL,
-  supabaseKeySet: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
-  useSupabaseSet: process.env.USE_SUPABASE,
-  zeroBounceKeySet: !!process.env.ZERO_BOUNCE_API_KEY,
-  useZeroBounceSet: process.env.USE_ZERO_BOUNCE,
-  clientIdSet: !!process.env.CLIENT_ID,
-  umessyVersionSet: !!process.env.UMESSY_VERSION,
-  nodeEnv: process.env.NODE_ENV || 'not set'
-});
-
-// Determine if we're running in Vercel
-const isVercel = !!process.env.VERCEL || !!process.env.VERCEL_URL;
-console.log('RUNTIME ENVIRONMENT:', {
-  isVercel,
-  vercelRegion: process.env.VERCEL_REGION || 'unknown',
-  platform: process.platform,
-  nodeVersion: process.version
-});
 
 // Load configuration with explicit values and defaults
 const config = {
@@ -78,53 +59,11 @@ const config = {
   }
 };
 
-// Log the configuration (safely)
-console.log('API CONFIGURATION:', {
-  useZeroBounce: config.useZeroBounce,
-  useSupabase: config.useSupabase,
-  supabaseUrlSet: !!config.supabase.url,
-  supabaseKeyLength: config.supabase.key ? config.supabase.key.length : 0,
-  timeouts: config.timeouts,
-  clientId: config.clientId,
-  umessyVersion: config.umessyVersion
-});
-
 // Initialize the email validation service
 const emailValidator = new EmailValidationService(config);
 
-// Test Supabase connection immediately to ensure it's available for the first request
-// The connection test has been improved to be more reliable
-(async () => {
-  try {
-    console.log('STARTUP: Testing Supabase connection...');
-    await emailValidator._testSupabaseConnectionAsync();
-    
-    // After the test, get the status
-    console.log('SUPABASE CONNECTION STATUS:', emailValidator.supabaseConnectionStatus || 'unknown');
-    
-    if (emailValidator.supabaseConnectionStatus === 'connected') {
-      console.log('✅ SUPABASE CONNECTION SUCCESSFUL: API is ready to use Supabase storage');
-    } else {
-      console.error('❌ SUPABASE CONNECTION ISSUE: API will operate without persistent storage');
-      
-      // Try one more time after a short delay
-      setTimeout(async () => {
-        try {
-          console.log('STARTUP: Retrying Supabase connection test...');
-          await emailValidator._testSupabaseConnectionAsync();
-          
-          if (emailValidator.supabaseConnectionStatus === 'connected') {
-            console.log('✅ SUPABASE CONNECTION SUCCESSFUL ON RETRY: API is now ready for storage');
-          }
-        } catch (retryError) {
-          console.error('STARTUP RETRY ERROR:', retryError);
-        }
-      }, 2000); // 2 second delay before retry
-    }
-  } catch (error) {
-    console.error('STARTUP ERROR:', error);
-  }
-})();
+// Initialize the client manager service
+const clientManager = new ClientManagerService();
 
 // Main API handler function
 export default async function handler(req, res) {
@@ -133,12 +72,51 @@ export default async function handler(req, res) {
     return healthCheck(req, res);
   }
   
+  // Client stats endpoint
+  if (req.url && req.url.endsWith('/stats')) {
+    return statsHandler(req, res);
+  }
+  
   // Only allow POST method for the main endpoint
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
   
   try {
+    // Get the API key from the request headers
+    const apiKey = req.headers['x-api-key'];
+    
+    // Validate the API key
+    const { valid, client, reason } = clientManager.validateApiKey(apiKey);
+    
+    if (!valid) {
+      console.log('API REQUEST: Invalid API key', { reason });
+      return res.status(401).json({ 
+        error: 'Unauthorized',
+        reason: reason
+      });
+    }
+    
+    // Check email rate limit for this client
+    const { limited, remaining, emailCount, emailLimit } = clientManager.checkEmailRateLimit(client.clientId);
+    
+    if (limited) {
+      console.log('API REQUEST: Email rate limit exceeded', { 
+        clientId: client.clientId,
+        emailCount,
+        emailLimit
+      });
+      
+      return res.status(429).json({
+        error: 'Email rate limit exceeded',
+        dailyLimit: emailLimit,
+        used: emailCount,
+        remaining: 0,
+        resetIn: getTimeUntilMidnight()
+      });
+    }
+    
+    // Extract email from request body
     const { email } = req.body;
     
     if (!email) {
@@ -147,9 +125,9 @@ export default async function handler(req, res) {
     
     // Log request info
     console.log('API REQUEST: Processing email validation', { 
+      clientId: client.clientId,
       email,
-      timestamp: new Date().toISOString(),
-      supabaseStatus: emailValidator.supabaseConnectionStatus || 'unknown'
+      timestamp: new Date().toISOString()
     });
     
     // Quick invalid format check
@@ -159,6 +137,9 @@ export default async function handler(req, res) {
       // Generate unmessy fields for invalid format
       const now = new Date();
       const umCheckId = emailValidator.generateUmCheckId();
+      
+      // Increment email count for this client
+      clientManager.incrementEmailCount(client.clientId);
       
       const result = {
         originalEmail: email,
@@ -174,11 +155,19 @@ export default async function handler(req, res) {
         um_email: email,
         email: email,
         um_email_status: 'Unable to change',
-        um_bounce_status: 'Likely to bounce'
+        um_bounce_status: 'Likely to bounce',
+        // Add client usage info
+        client: {
+          id: client.clientId,
+          emailLimit,
+          emailCount: emailCount + 1,
+          remaining: remaining - 1
+        }
       };
       
       // Log the result before returning
       console.log('API RESPONSE: Returning invalid format result', {
+        clientId: client.clientId,
         email,
         status: result.status,
         subStatus: result.subStatus
@@ -197,13 +186,12 @@ export default async function handler(req, res) {
     try {
       // Log that we're starting validation
       console.log('VALIDATION: Starting validation process', {
+        clientId: client.clientId,
         email,
-        supabaseStatus: emailValidator.supabaseConnectionStatus || 'unknown',
         zeroBounceEnabled: config.useZeroBounce
       });
       
       // Race between validation and timeout
-      // NOTE: The updated validateEmail method now saves data synchronously
       const result = await Promise.race([
         emailValidator.validateEmail(email, { 
           skipZeroBounce: !config.useZeroBounce, 
@@ -212,8 +200,23 @@ export default async function handler(req, res) {
         timeoutPromise
       ]);
       
+      // Increment email count for this client
+      clientManager.incrementEmailCount(client.clientId);
+      
+      // Get updated usage info
+      const { limited, remaining, emailCount, emailLimit } = clientManager.checkEmailRateLimit(client.clientId);
+      
+      // Add client info to the result
+      result.client = {
+        id: client.clientId,
+        emailLimit,
+        emailCount,
+        remaining
+      };
+      
       // Log success and return result
       console.log('API RESPONSE: Validation completed successfully', {
+        clientId: client.clientId,
         email,
         status: result.status,
         wasCorrected: result.wasCorrected,
@@ -225,15 +228,31 @@ export default async function handler(req, res) {
     } catch (error) {
       // Log the error and fall back to quick validation
       console.error('VALIDATION ERROR: Validation timed out or failed', {
+        clientId: client.clientId,
         email,
         error: error.message,
         stack: error.stack?.split('\n')[0]
       });
       
+      // Increment email count for this client
+      clientManager.incrementEmailCount(client.clientId);
+      
       // Get quick validation result as a fallback
       const quickResult = emailValidator.quickValidate(email);
       
+      // Get updated usage info
+      const { limited, remaining, emailCount, emailLimit } = clientManager.checkEmailRateLimit(client.clientId);
+      
+      // Add client info to the result
+      quickResult.client = {
+        id: client.clientId,
+        emailLimit,
+        emailCount,
+        remaining
+      };
+      
       console.log('API RESPONSE: Falling back to quick validation result', {
+        clientId: client.clientId,
         email,
         fallbackStatus: quickResult.status
       });
@@ -261,56 +280,21 @@ async function healthCheck(req, res) {
   }
   
   try {
-    // Check Supabase connection
-    let supabaseStatus = emailValidator.supabaseConnectionStatus || 'unknown';
-    let directCheckResult = null;
-    
-    // If connection status is not connected, try a direct check
-    if (supabaseStatus !== 'connected' && emailValidator.supabase) {
-      try {
-        const { data, error: queryError } = await emailValidator.supabase
-          .from('contacts')
-          .select('count(*)', { count: 'exact', head: true });
-          
-        if (queryError) {
-          directCheckResult = {
-            status: 'error',
-            error: queryError.message,
-            code: queryError.code
-          };
-        } else {
-          directCheckResult = {
-            status: 'success',
-            data
-          };
-          // Update status if direct check succeeded
-          supabaseStatus = 'connected_direct';
-        }
-      } catch (e) {
-        directCheckResult = {
-          status: 'exception',
-          error: e.message
-        };
-      }
-    }
+    // Get clients stats
+    const clientsStats = clientManager.listClientsStats();
     
     // Return health status
     return res.status(200).json({
       status: 'ok',
       timestamp: new Date().toISOString(),
-      version: '1.0.0',
+      version: '1.1.0',
       environment: {
         nodeEnv: process.env.NODE_ENV || 'not set',
-        isVercel: isVercel,
+        isVercel: !!process.env.VERCEL || !!process.env.VERCEL_URL,
         vercelRegion: process.env.VERCEL_REGION || 'unknown'
       },
-      supabase: {
-        status: supabaseStatus,
-        enabled: emailValidator.supabaseEnabled,
-        url: emailValidator.config.supabase.url ? `${emailValidator.config.supabase.url.substring(0, 15)}...` : 'not set',
-        keyPresent: !!emailValidator.config.supabase.key,
-        directCheck: directCheckResult
-      }
+      clientsCount: clientsStats.length,
+      supabaseEnabled: emailValidator.supabaseEnabled
     });
   } catch (error) {
     return res.status(500).json({
@@ -318,4 +302,80 @@ async function healthCheck(req, res) {
       error: error.message
     });
   }
+}
+
+// Stats handler implementation
+async function statsHandler(req, res) {
+  if (req.method !== 'GET') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+  
+  try {
+    // Get API key from headers
+    const apiKey = req.headers['x-api-key'];
+    
+    // Check if this is an admin key
+    const isAdmin = apiKey === process.env.ADMIN_API_KEY;
+    
+    // If not admin, validate the API key
+    let clientId = null;
+    if (!isAdmin) {
+      const { valid, client, reason } = clientManager.validateApiKey(apiKey);
+      
+      if (!valid) {
+        return res.status(401).json({ 
+          error: 'Unauthorized',
+          reason: reason
+        });
+      }
+      
+      clientId = client.clientId;
+    }
+    
+    // If admin, show all clients stats
+    if (isAdmin) {
+      const clientsStats = clientManager.listClientsStats();
+      
+      return res.status(200).json({
+        status: 'ok',
+        timestamp: new Date().toISOString(),
+        clientsCount: clientsStats.length,
+        clients: clientsStats
+      });
+    }
+    
+    // Otherwise, show only this client's stats
+    const clientStats = clientManager.getClientStats(clientId);
+    
+    if (!clientStats.found) {
+      return res.status(404).json({
+        error: 'Client not found'
+      });
+    }
+    
+    return res.status(200).json({
+      status: 'ok',
+      timestamp: new Date().toISOString(),
+      client: clientStats
+    });
+  } catch (error) {
+    return res.status(500).json({
+      status: 'error',
+      error: error.message
+    });
+  }
+}
+
+// Helper function to get time until midnight
+function getTimeUntilMidnight() {
+  const now = new Date();
+  const tomorrow = new Date(now);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  tomorrow.setHours(0, 0, 0, 0);
+  
+  const diffMs = tomorrow - now;
+  const diffHrs = Math.floor(diffMs / (1000 * 60 * 60));
+  const diffMins = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+  
+  return `${diffHrs}h ${diffMins}m`;
 }

@@ -1,3 +1,4 @@
+// src/services/email-validator.js
 import { createClient } from '@supabase/supabase-js';
 
 export class EmailValidationService {
@@ -188,17 +189,20 @@ export class EmailValidationService {
   }
   
   // Generate um_check_id based on specification
-  generateUmCheckId() {
+  generateUmCheckId(customClientId = null) {
     const epochTime = Math.floor(Date.now() / 1000);
     const lastSixDigits = String(epochTime).slice(-6);
+    
+    // Use provided client ID or default
+    const clientId = customClientId || this.clientId;
     
     // Calculate check digit
     const firstThreeDigits = String(epochTime).slice(0, 3);
     const sum = [...firstThreeDigits].reduce((acc, digit) => acc + parseInt(digit), 0);
-    const checkDigit = String(sum * parseInt(this.clientId)).padStart(3, '0');
+    const checkDigit = String(sum * parseInt(clientId)).padStart(3, '0');
     
     // Format: lastSixDigits + clientId + checkDigit + version
-    return `${lastSixDigits}${this.clientId}${checkDigit}${this.umessyVersion}`;
+    return `${lastSixDigits}${clientId}${checkDigit}${this.umessyVersion}`;
   }
   
   // Non-blocking Supabase check - doesn't throw, returns false on failure
@@ -255,7 +259,7 @@ export class EmailValidationService {
   }
   
   // Save validation result to Supabase with improved reliability
-  async saveValidationResult(originalEmail, validationResult) {
+  async saveValidationResult(originalEmail, validationResult, clientId = null) {
     if (!this.supabaseEnabled || !this.supabase) {
       console.log('SUPABASE_SAVE: Supabase not enabled, skipping save', {
         supabaseEnabled: this.supabaseEnabled,
@@ -295,10 +299,13 @@ export class EmailValidationService {
     }
 
     try {
-      console.log('SUPABASE_SAVE: Starting save operation for email', { email: originalEmail });
+      console.log('SUPABASE_SAVE: Starting save operation for email', { 
+        email: originalEmail,
+        clientId: clientId || 'default'
+      });
       
       // Create a check ID for this validation if not already present
-      const umCheckId = validationResult.um_check_id || this.generateUmCheckId();
+      const umCheckId = validationResult.um_check_id || this.generateUmCheckId(clientId);
       const now = new Date();
       
       // Map validation status to um_email_status and um_bounce_status
@@ -357,14 +364,16 @@ export class EmailValidationService {
         um_email: validationResult.currentEmail || validationResult.um_email || originalEmail,
         email: originalEmail,
         um_email_status: umEmailStatus,
-        um_bounce_status: umBounceStatus
+        um_bounce_status: umBounceStatus,
+        client_id: clientId || null // Store the client ID that requested this validation
       };
       
       try {
         console.log('SUPABASE_SAVE: Creating new validation record', {
           contactId,
           email: originalEmail,
-          umEmail: validationData.um_email
+          umEmail: validationData.um_email,
+          clientId: clientId || 'default'
         });
         
         const { data, error } = await this.supabase
@@ -384,7 +393,8 @@ export class EmailValidationService {
         console.log('SUPABASE_SAVE: Successfully saved validation result', {
           email: originalEmail,
           operation: 'insert',
-          id: data.id
+          id: data.id,
+          clientId: clientId || 'default'
         });
         
         return { success: true, operation: 'insert', data };
@@ -470,7 +480,7 @@ export class EmailValidationService {
   }
   
   // Fast local validation without external services
-  quickValidate(email) {
+  quickValidate(email, clientId = null) {
     // Step 1: Format check
     const formatValid = this.isValidEmailFormat(email);
     if (!formatValid) {
@@ -494,7 +504,7 @@ export class EmailValidationService {
     const status = domainValid ? 'valid' : 'unknown';
     
     // Generate um_check_id
-    const umCheckId = this.generateUmCheckId();
+    const umCheckId = this.generateUmCheckId(clientId);
     const now = new Date();
     
     // Determine Unmessy statuses
@@ -526,7 +536,7 @@ export class EmailValidationService {
   }
   
   // ZeroBounce check with proper timeout handling and did_you_mean handling
-  async checkWithZeroBounce(email) {
+  async checkWithZeroBounce(email, clientId = null) {
     if (!this.config.zeroBounceApiKey || this.config.useZeroBounce === false) {
       console.log('ZEROBOUNCE_CHECK: ZeroBounce not configured or disabled, skipping check');
       return {
@@ -538,7 +548,10 @@ export class EmailValidationService {
     }
 
     try {
-      console.log('ZEROBOUNCE_CHECK: Starting validation for email', { email });
+      console.log('ZEROBOUNCE_CHECK: Starting validation for email', { 
+        email,
+        clientId: clientId || 'default'
+      });
       
       const result = await this.withTimeout(
         async (signal) => {
@@ -567,14 +580,12 @@ export class EmailValidationService {
             didYouMean: result.did_you_mean || null
           });
           
-          // Map ZeroBounce status to our status
-          let status, subStatus, recheckNeeded, suggestedEmail = null;
-          
           // Generate unmessy fields
-          const umCheckId = this.generateUmCheckId();
+          const umCheckId = this.generateUmCheckId(clientId);
           const now = new Date();
           
           // Check for "did_you_mean" suggestions
+          let suggestedEmail = null;
           if (result.did_you_mean) {
             console.log('ZEROBOUNCE_CHECK: Found email suggestion from ZeroBounce', {
               original: email,
@@ -586,6 +597,7 @@ export class EmailValidationService {
           // Map status and determine unmessy statuses
           let umEmailStatus = suggestedEmail ? 'Changed' : 'Unchanged';
           let umBounceStatus = 'Unknown';
+          let status, subStatus, recheckNeeded;
           
           switch (result.status) {
             case 'valid':
@@ -626,7 +638,8 @@ export class EmailValidationService {
             status, 
             subStatus,
             recheckNeeded,
-            suggestedEmail
+            suggestedEmail,
+            clientId: clientId || 'default'
           });
           
           return {
@@ -653,7 +666,11 @@ export class EmailValidationService {
       
       return result;
     } catch (error) {
-      console.error('ZEROBOUNCE_CHECK_ERROR:', { message: error.message, email });
+      console.error('ZEROBOUNCE_CHECK_ERROR:', { 
+        message: error.message, 
+        email,
+        clientId: clientId || 'default'
+      });
       return {
         email,
         status: 'check_failed',
@@ -667,18 +684,24 @@ export class EmailValidationService {
   // Save data synchronously during the validation process
   // This is a critical change to fix the data saving issue
   async validateEmail(email, options = {}) {
-    const { skipZeroBounce = false, timeoutMs = this.timeouts.validation, isRetry = false } = options;
+    const { 
+      skipZeroBounce = false, 
+      timeoutMs = this.timeouts.validation, 
+      isRetry = false,
+      clientId = null  // New parameter to track which client made the request
+    } = options;
     
     console.log('VALIDATION_PROCESS: Starting validation for email', { 
       email, 
       skipZeroBounce, 
       timeoutMs,
       isRetry,
+      clientId: clientId || 'default',
       supabaseStatus: this.supabaseConnectionStatus
     });
     
     // Start with quick validation (synchronous, always works)
-    const quickResult = this.quickValidate(email);
+    const quickResult = this.quickValidate(email, clientId);
     
     // If format is invalid, return immediately
     if (!quickResult.formatValid) {
@@ -698,7 +721,7 @@ export class EmailValidationService {
           // Run Supabase check and ZeroBounce check in parallel
           const [knownValidResult, zeroBounceResult] = await Promise.allSettled([
             this.isKnownValidEmail(quickResult.currentEmail),
-            skipZeroBounce ? null : this.checkWithZeroBounce(quickResult.currentEmail)
+            skipZeroBounce ? null : this.checkWithZeroBounce(quickResult.currentEmail, clientId)
           ]);
           
           // Start with the quick result and enhance it
@@ -756,7 +779,8 @@ export class EmailValidationService {
               email: quickResult.currentEmail,
               status: bounceCheck.status,
               subStatus: bounceCheck.subStatus,
-              suggestedEmail: bounceCheck.suggestedEmail
+              suggestedEmail: bounceCheck.suggestedEmail,
+              clientId: clientId || 'default'
             });
             
             // Check for suggested email from ZeroBounce
@@ -770,7 +794,8 @@ export class EmailValidationService {
               const suggestedEmailResult = await this.validateEmail(bounceCheck.suggestedEmail, {
                 skipZeroBounce: false,  // Always check with ZeroBounce for the suggested email
                 timeoutMs: timeoutMs * 0.8,  // Reduce timeout for the retry to ensure we don't exceed the original
-                isRetry: true  // Mark this as a retry to prevent infinite loops
+                isRetry: true,  // Mark this as a retry to prevent infinite loops
+                clientId: clientId  // Pass along client ID
               });
               
               // Add information about the suggestion to the result
@@ -790,7 +815,8 @@ export class EmailValidationService {
               console.log('VALIDATION_PROCESS: Completed validation with ZeroBounce suggestion', {
                 originalEmail: email,
                 suggestedEmail: bounceCheck.suggestedEmail,
-                finalStatus: suggestedEmailResult.status
+                finalStatus: suggestedEmailResult.status,
+                clientId: clientId || 'default'
               });
               
               return suggestedEmailResult;
@@ -828,7 +854,8 @@ export class EmailValidationService {
           console.log('VALIDATION_PROCESS: All validation steps completed successfully', {
             email: quickResult.currentEmail,
             finalStatus: result.status,
-            recheckNeeded: result.recheckNeeded
+            recheckNeeded: result.recheckNeeded,
+            clientId: clientId || 'default'
           });
           
           // CRITICAL FIX: Save to Supabase synchronously during validation process
@@ -836,15 +863,17 @@ export class EmailValidationService {
           if (this.supabaseEnabled) {
             try {
               console.log('VALIDATION_PROCESS: Starting synchronous save to Supabase');
-              const saveResult = await this.saveValidationResult(email, result);
+              const saveResult = await this.saveValidationResult(email, result, clientId);
               console.log('VALIDATION_PROCESS: Supabase save completed', { 
                 success: saveResult.success,
                 operation: saveResult.operation,
-                dataId: saveResult.data?.id || 'none'
+                dataId: saveResult.data?.id || 'none',
+                clientId: clientId || 'default'
               });
             } catch (saveError) {
               console.error('VALIDATION_PROCESS: Error during synchronous save', {
-                error: saveError.message
+                error: saveError.message,
+                clientId: clientId || 'default'
               });
             }
           }
@@ -857,17 +886,22 @@ export class EmailValidationService {
       
       return result;
     } catch (error) {
-      console.error('VALIDATION_TIMEOUT:', { message: error.message, email });
+      console.error('VALIDATION_TIMEOUT:', { 
+        message: error.message, 
+        email,
+        clientId: clientId || 'default'
+      });
       console.log('VALIDATION_PROCESS: Using quick validation result as fallback due to timeout');
       
       // Try to save quick result to Supabase synchronously
       if (this.supabaseEnabled) {
         try {
           console.log('VALIDATION_PROCESS: Saving fallback result to Supabase');
-          await this.saveValidationResult(email, quickResult);
+          await this.saveValidationResult(email, quickResult, clientId);
         } catch (saveError) {
           console.error('VALIDATION_PROCESS: Error saving fallback result', {
-            error: saveError.message
+            error: saveError.message,
+            clientId: clientId || 'default'
           });
         }
       }
@@ -879,11 +913,20 @@ export class EmailValidationService {
   
   // Batch validation with time budget management
   async validateBatch(emails, options = {}) {
-    const { skipZeroBounce = false, timeoutPerEmailMs = 2000 } = options;
+    const { 
+      skipZeroBounce = false, 
+      timeoutPerEmailMs = 2000,
+      clientId = null  // New parameter to track which client made the request
+    } = options;
+    
+    console.log('BATCH_VALIDATION: Starting batch validation', { 
+      batchSize: emails.length,
+      clientId: clientId || 'default'
+    });
     
     const results = [];
     const batchStartTime = Date.now();
-    const totalBatchTimeoutMs = Math.min(5000, emails.length * timeoutPerEmailMs);
+    const totalBatchTimeoutMs = Math.min(9000, emails.length * timeoutPerEmailMs);
     
     for (let i = 0; i < emails.length; i++) {
       const email = emails[i];
@@ -894,9 +937,15 @@ export class EmailValidationService {
       
       // If we're running out of time, use quick validation for remaining emails
       if (remainingTimeMs < timeoutPerEmailMs / 2) {
+        console.log('BATCH_VALIDATION: Running out of time, using quick validation for remaining emails', {
+          processed: i,
+          remaining: emails.length - i,
+          remainingTimeMs
+        });
+        
         // Process remaining emails with quick validation
         for (let j = i; j < emails.length; j++) {
-          results.push(this.quickValidate(emails[j]));
+          results.push(this.quickValidate(emails[j], clientId));
         }
         break;
       }
@@ -905,25 +954,39 @@ export class EmailValidationService {
         // Validate with appropriate timeout
         const result = await this.validateEmail(email, {
           skipZeroBounce,
-          timeoutMs: Math.min(remainingTimeMs, timeoutPerEmailMs)
+          timeoutMs: Math.min(remainingTimeMs, timeoutPerEmailMs),
+          clientId
         });
         
         results.push(result);
       } catch (error) {
+        console.error('BATCH_VALIDATION_ERROR:', {
+          email,
+          error: error.message,
+          clientId: clientId || 'default'
+        });
+        
         // Fall back to quick validation
-        results.push(this.quickValidate(email));
+        results.push(this.quickValidate(email, clientId));
       }
     }
+    
+    console.log('BATCH_VALIDATION: Completed batch validation', {
+      batchSize: emails.length,
+      resultsCount: results.length,
+      clientId: clientId || 'default'
+    });
     
     return results;
   }
   
   // Update HubSpot contact with proper timeout handling
-  async updateHubSpotContact(contactId, validationResult) {
+  async updateHubSpotContact(contactId, validationResult, clientId = null) {
     console.log('HUBSPOT_UPDATE: Starting contact update', {
       contactId,
       validationStatus: validationResult.status,
-      email: validationResult.currentEmail
+      email: validationResult.currentEmail,
+      clientId: clientId || 'default'
     });
     
     if (!this.config.hubspot?.apiKey) {
@@ -951,7 +1014,10 @@ export class EmailValidationService {
             um_email_status: validationResult.um_email_status,
             um_bounce_status: validationResult.um_bounce_status,
             date_last_um_check: validationResult.date_last_um_check,
-            um_check_id: validationResult.um_check_id
+            um_check_id: validationResult.um_check_id,
+            
+            // Add client ID that performed the validation
+            validation_client_id: clientId || this.clientId
           };
           
           // Add original email if corrected (either by built-in corrections or ZeroBounce suggestion)
@@ -982,7 +1048,8 @@ export class EmailValidationService {
           
           console.log('HUBSPOT_UPDATE: Sending update request', {
             contactId,
-            properties: Object.keys(properties).join(', ')
+            properties: Object.keys(properties).join(', '),
+            clientId: clientId || 'default'
           });
           
           // Send update request
@@ -1013,7 +1080,8 @@ export class EmailValidationService {
           
           console.log('HUBSPOT_UPDATE: Successfully updated contact', {
             contactId,
-            responseId: data.id
+            responseId: data.id,
+            clientId: clientId || 'default'
           });
           
           return {
@@ -1026,7 +1094,11 @@ export class EmailValidationService {
         'HubSpot update timeout'
       );
     } catch (error) {
-      console.error('HUBSPOT_UPDATE_ERROR:', { message: error.message, contactId });
+      console.error('HUBSPOT_UPDATE_ERROR:', { 
+        message: error.message, 
+        contactId,
+        clientId: clientId || 'default'
+      });
       return {
         success: false,
         contactId,
