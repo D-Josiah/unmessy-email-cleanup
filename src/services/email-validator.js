@@ -6,18 +6,16 @@ export class EmailValidationService {
 
     // Initialize Supabase
     this.supabase = null;
-    this.supabaseEnabled = !!(config.supabase &&
-                             config.supabase.url &&
+    this.supabaseEnabled = !!(config.supabase && 
+                             config.supabase.url && 
                              config.supabase.key &&
                              config.useSupabase !== false);
-
+    
     // Timeouts configuration with defaults - shorter timeouts to prevent HubSpot flow hanging
     this.timeouts = {
-      supabase: config.timeouts?.supabase || 5000,  // Increased timeout to 5 seconds for Supabase
+      supabase: config.timeouts?.supabase || 5000,  // Increased timeout for Supabase queries
       zeroBounce: config.timeouts?.zeroBounce || 3000,
-      hubspot: config.timeouts?.hubspot || 5000,
       validation: config.timeouts?.validation || 4000, 
-      webhook: config.timeouts?.webhook || 6000
     };
 
     // Initialize Supabase client
@@ -33,7 +31,6 @@ export class EmailValidationService {
         this._testSupabaseConnectionAsync();
       } catch (error) {
         console.error('SUPABASE_INIT_ERROR:', { message: error.message });
-        // Still keep Supabase enabled for future attempts
       }
     }
 
@@ -52,8 +49,6 @@ export class EmailValidationService {
       'outlok.com': 'outlook.com'
     };
 
-    this.australianTlds = ['.com.au', '.net.au', '.org.au', '.edu.au', '.gov.au', '.asn.au', '.id.au', '.au'];
-
     // Extended list of common domains for local validation
     this.commonValidDomains = [
       'gmail.com', 'outlook.com', 'hotmail.com', 'yahoo.com', 'icloud.com', 
@@ -61,10 +56,6 @@ export class EmailValidationService {
       'yandex.com', 'gmx.com', 'live.com', 'msn.com', 'me.com', 'mac.com', 
       'googlemail.com', 'pm.me', 'tutanota.com', 'mailbox.org'
     ];
-
-    // Client ID for um_check_id generation
-    this.clientId = config.clientId || '00001';
-    this.umessyVersion = config.umessyVersion || '100';
   }
 
   // Asynchronous test without blocking operations
@@ -91,7 +82,6 @@ export class EmailValidationService {
       console.log('SUPABASE_CONNECTION_TEST: Test query successful');
     } catch (error) {
       console.error('SUPABASE_CONNECTION_TEST_FAILED:', { message: error.message });
-      // Non-blocking - just log the error
     }
   }
 
@@ -113,21 +103,7 @@ export class EmailValidationService {
       throw error;
     }
   }
-  
-  // Generate um_check_id based on specification
-  generateUmCheckId() {
-    const epochTime = Math.floor(Date.now() / 1000);
-    const lastSixDigits = String(epochTime).slice(-6);
-    
-    // Calculate check digit
-    const firstThreeDigits = String(epochTime).slice(0, 3);
-    const sum = [...firstThreeDigits].reduce((acc, digit) => acc + parseInt(digit), 0);
-    const checkDigit = String(sum * parseInt(this.clientId)).padStart(3, '0');
-    
-    // Format: lastSixDigits + clientId + checkDigit + version
-    return `${lastSixDigits}${this.clientId}${checkDigit}${this.umessyVersion}`;
-  }
-  
+
   // Non-blocking Supabase check - doesn't throw, returns false on failure
   async isKnownValidEmail(email) {
     if (!this.supabaseEnabled || !this.supabase) {
@@ -136,11 +112,10 @@ export class EmailValidationService {
     }
 
     try {
-      // Use AbortController and timeout
       const result = await this.withTimeout(
         async (signal) => {
           console.log('SUPABASE_CHECK: Attempting to check if email exists in Supabase', { email });
-          
+
           const { data, error } = await this.supabase
             .from('email_validations')
             .select('email, um_email_status')
@@ -168,12 +143,6 @@ export class EmailValidationService {
         'Supabase check timeout'
       );
       
-      if (result.found) {
-        console.log('SUPABASE_CHECK: Email found in Supabase database', { email });
-      } else {
-        console.log('SUPABASE_CHECK: Email not found in Supabase database', { email });
-      }
-      
       return result;
     } catch (error) {
       console.error('SUPABASE_GET_ERROR:', { message: error.message, email });
@@ -191,11 +160,9 @@ export class EmailValidationService {
     try {
       return await this.withTimeout(
         async (signal) => {
-          // Create a check ID for this validation
           const umCheckId = this.generateUmCheckId();
           const now = new Date();
           
-          // Map validation status to um_email_status and um_bounce_status
           let umEmailStatus = 'Unable to change';
           let umBounceStatus = 'Unknown';
           
@@ -214,8 +181,7 @@ export class EmailValidationService {
           // First, check if we need to create a contact
           let contactId;
           
-          // Look for existing contact with this email
-          const { data: existingContact, error: contactLookupError } = await this.supabase
+          const { data: existingContact, error: contactError } = await this.supabase
             .from('email_validations')
             .select('contact_id')
             .eq('email', originalEmail)
@@ -240,7 +206,7 @@ export class EmailValidationService {
             contactId = newContact.id;
           }
           
-          // Now insert or update the email validation record
+          // Insert or update the email validation record
           const validationData = {
             contact_id: contactId,
             date_last_um_check: now.toISOString(),
@@ -251,55 +217,19 @@ export class EmailValidationService {
             um_email_status: umEmailStatus,
             um_bounce_status: umBounceStatus
           };
-          
-          // Check if record already exists for this email
-          const { data: existingValidation, error: validationLookupError } = await this.supabase
+
+          const { data, error: insertError } = await this.supabase
             .from('email_validations')
-            .select('id')
-            .eq('email', originalEmail)
+            .insert(validationData)
+            .select()
             .abortSignal(signal)
             .single();
-            
-          let result;
-          
-          if (existingValidation) {
-            // Update existing record
-            const { data, error } = await this.supabase
-              .from('email_validations')
-              .update(validationData)
-              .eq('id', existingValidation.id)
-              .select()
-              .abortSignal(signal)
-              .single();
-              
-            if (error) {
-              throw new Error(`Failed to update validation record: ${error.message}`);
-            }
-            
-            result = { success: true, operation: 'update', data };
-          } else {
-            // Insert new record
-            const { data, error } = await this.supabase
-              .from('email_validations')
-              .insert(validationData)
-              .select()
-              .abortSignal(signal)
-              .single();
-              
-            if (error) {
-              throw new Error(`Failed to insert validation record: ${error.message}`);
-            }
-            
-            result = { success: true, operation: 'insert', data };
+
+          if (insertError) {
+            throw new Error(`Failed to insert validation record: ${insertError.message}`);
           }
           
-          console.log('SUPABASE_SAVE: Successfully saved validation result', {
-            email: originalEmail,
-            operation: result.operation,
-            id: result.data.id
-          });
-          
-          return result;
+          return { success: true, data };
         },
         this.timeouts.supabase,
         'Supabase save timeout'
@@ -309,13 +239,13 @@ export class EmailValidationService {
       return { success: false, error: error.message };
     }
   }
-  
+
   // Basic format validation - fast and synchronous  
   isValidEmailFormat(email) {
     const emailRegex = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
     return emailRegex.test(email);
   }
-  
+
   // Typo correction - fast and synchronous
   correctEmailTypos(email) {
     if (!email) {
@@ -342,7 +272,7 @@ export class EmailValidationService {
     
     return { corrected, email: cleanedEmail };
   }
-  
+
   // Fast domain check - synchronous
   isValidDomain(email) {
     try {
@@ -352,62 +282,6 @@ export class EmailValidationService {
     } catch (error) {
       return false;
     }
-  }
-  
-  // Fast local validation without external services
-  quickValidate(email) {
-    // Step 1: Format check
-    const formatValid = this.isValidEmailFormat(email);
-    if (!formatValid) {
-      return {
-        originalEmail: email,
-        currentEmail: email,
-        formatValid: false,
-        wasCorrected: false,
-        status: 'invalid',
-        subStatus: 'bad_format',
-        recheckNeeded: false,
-        validationSteps: [{ step: 'format_check', passed: false }]
-      };
-    }
-    
-    // Step 2: Correct typos
-    const { corrected, email: correctedEmail } = this.correctEmailTypos(email);
-    
-    // Step 3: Domain check
-    const domainValid = this.isValidDomain(correctedEmail);
-    const status = domainValid ? 'valid' : 'unknown';
-    
-    // Generate um_check_id
-    const umCheckId = this.generateUmCheckId();
-    const now = new Date();
-    
-    // Determine Unmessy statuses
-    const umEmailStatus = corrected ? 'Changed' : 'Unchanged';
-    const umBounceStatus = domainValid ? 'Unlikely to bounce' : 'Unknown';
-    
-    return {
-      originalEmail: email,
-      currentEmail: correctedEmail,
-      formatValid: true,
-      wasCorrected: corrected,
-      domainValid,
-      status,
-      recheckNeeded: !domainValid,
-      validationSteps: [
-        { step: 'format_check', passed: true },
-        { step: 'typo_correction', applied: corrected, original: email, corrected: correctedEmail },
-        { step: 'domain_check', passed: domainValid }
-      ],
-      // Add unmessy specific fields
-      date_last_um_check: now.toISOString(),
-      date_last_um_check_epoch: Math.floor(now.getTime() / 1000),
-      um_check_id: umCheckId,
-      um_email: correctedEmail,
-      email: email,
-      um_email_status: umEmailStatus,
-      um_bounce_status: umBounceStatus
-    };
   }
 
   // ZeroBounce check with proper timeout handling and did_you_mean handling
@@ -432,11 +306,6 @@ export class EmailValidationService {
           url.searchParams.append('email', email);
           url.searchParams.append('ip_address', '');
           
-          console.log('ZEROBOUNCE_CHECK: Sending request to ZeroBounce API', { 
-            email,
-            url: url.toString().replace(this.config.zeroBounceApiKey, '[REDACTED]')
-          });
-          
           const response = await fetch(url.toString(), { signal });
           
           if (!response.ok) {
@@ -445,14 +314,6 @@ export class EmailValidationService {
           
           const result = await response.json();
           
-          console.log('ZEROBOUNCE_CHECK: Received response from ZeroBounce API', { 
-            email,
-            status: result.status,
-            subStatus: result.sub_status,
-            didYouMean: result.did_you_mean || null
-          });
-          
-          // Map ZeroBounce status to our status
           let status, subStatus, recheckNeeded, suggestedEmail = null;
           
           // Generate unmessy fields
@@ -461,28 +322,19 @@ export class EmailValidationService {
           
           // Check for "did_you_mean" suggestions
           if (result.did_you_mean) {
-            console.log('ZEROBOUNCE_CHECK: Found email suggestion from ZeroBounce', {
-              original: email,
-              suggested: result.did_you_mean
-            });
             suggestedEmail = result.did_you_mean;
           }
           
           // Map status and determine unmessy statuses
-          let umEmailStatus = suggestedEmail ? 'Changed' : 'Unchanged';
-          let umBounceStatus = 'Unknown';
-          
           switch (result.status) {
             case 'valid':
               status = 'valid';
               recheckNeeded = false;
-              umBounceStatus = 'Unlikely to bounce';
               break;
             case 'invalid':
               status = 'invalid';
               subStatus = result.sub_status;
               recheckNeeded = false;
-              umBounceStatus = 'Likely to bounce';
               break;
             case 'catch-all':
             case 'unknown':
@@ -493,35 +345,15 @@ export class EmailValidationService {
               status = 'invalid';
               subStatus = 'spamtrap';
               recheckNeeded = false;
-              umBounceStatus = 'Likely to bounce';
               break;
             case 'abuse':
               status = 'invalid';
               subStatus = 'abuse';
               recheckNeeded = false;
-              umBounceStatus = 'Likely to bounce';
               break;
             default:
               status = 'check_failed';
               recheckNeeded = true;
-          }
-          
-          console.log('ZEROBOUNCE_CHECK: Completed successfully', { 
-            email, 
-            status, 
-            subStatus,
-            recheckNeeded,
-            suggestedEmail
-          });
-          
-          // If valid, try to save to Supabase in background (don't await)
-          if (status === 'valid') {
-            this.saveValidationResult(email, {
-              currentEmail: suggestedEmail || email,
-              wasCorrected: !!suggestedEmail,
-              status,
-              recheckNeeded
-            }).catch(() => {});
           }
           
           return {
@@ -531,15 +363,7 @@ export class EmailValidationService {
             recheckNeeded,
             suggestedEmail,
             source: 'zerobounce',
-            details: result,
-            // Add unmessy specific fields
-            date_last_um_check: now.toISOString(),
-            date_last_um_check_epoch: Math.floor(now.getTime() / 1000),
-            um_check_id: umCheckId,
-            um_email: suggestedEmail || email,
-            email: email,
-            um_email_status: umEmailStatus,
-            um_bounce_status: umBounceStatus
+            details: result
           };
         },
         this.timeouts.zeroBounce,
