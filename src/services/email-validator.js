@@ -13,7 +13,7 @@ export class EmailValidationService {
 
     // Timeouts configuration with defaults - shorter timeouts to prevent HubSpot flow hanging
     this.timeouts = {
-      supabase: config.timeouts?.supabase || 1500,  // Increased timeout to 5 seconds for Supabase
+      supabase: config.timeouts?.supabase || 5000,  // Increased timeout to 5 seconds for Supabase
       zeroBounce: config.timeouts?.zeroBounce || 3000,
       hubspot: config.timeouts?.hubspot || 5000,
       validation: config.timeouts?.validation || 4000, 
