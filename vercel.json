@@ -1,15 +1,6 @@
 {
   "version": 2,
   "regions": ["syd1"], 
-  "builds": [
-    { 
-      "src": "api/**/*.js", 
-      "use": "@vercel/node",
-      "config": { 
-        "includeFiles": ["src/**"] 
-      }
-    }
-  ],
   "functions": {
     "api/**/*.js": {
       "memory": 4096,
