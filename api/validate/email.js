@@ -6,7 +6,7 @@ dotenv.config();
 
 // Detailed logging for configuration and connection status
 console.log('=============================================');
-console.log('EMAIL VALIDATION API STARTUP - OPTIMIZED VERSION');
+console.log('EMAIL VALIDATION API STARTUP - FIXED VERSION');
 console.log('=============================================');
 
 // Log environment variables (safely)
@@ -70,11 +70,11 @@ const config = {
   clientId: process.env.CLIENT_ID || '00001',
   umessyVersion: process.env.UMESSY_VERSION || '100',
   
-  // Timeouts - increased for reliability but staying within Vercel limits
+  // Timeouts - increased but staying within Vercel limits
   timeouts: {
-    supabase: 6000,      // 6 seconds for Supabase operations
-    zeroBounce: 4000,    // 4 seconds for ZeroBounce operations
-    validation: 4000,    // 4 seconds for overall validation
+    supabase: 8000,       // 8 seconds for Supabase operations 
+    zeroBounce: 4000,     // 4 seconds for ZeroBounce operations
+    validation: 7000,     // 7 seconds for overall validation
   }
 };
 
@@ -92,11 +92,11 @@ console.log('API CONFIGURATION:', {
 // Initialize the email validation service
 const emailValidator = new EmailValidationService(config);
 
-// Test Supabase connection after a short delay to allow server startup
-// In Vercel, we don't want to block cold starts, so we do this in the background
-setTimeout(async () => {
+// Test Supabase connection immediately to ensure it's available for the first request
+// The connection test has been improved to be more reliable
+(async () => {
   try {
-    console.log('STARTUP: Testing Supabase connection (delayed)...');
+    console.log('STARTUP: Testing Supabase connection...');
     await emailValidator._testSupabaseConnectionAsync();
     
     // After the test, get the status
@@ -106,31 +106,27 @@ setTimeout(async () => {
       console.log('✅ SUPABASE CONNECTION SUCCESSFUL: API is ready to use Supabase storage');
     } else {
       console.error('❌ SUPABASE CONNECTION ISSUE: API will operate without persistent storage');
+      
+      // Try one more time after a short delay
+      setTimeout(async () => {
+        try {
+          console.log('STARTUP: Retrying Supabase connection test...');
+          await emailValidator._testSupabaseConnectionAsync();
+          
+          if (emailValidator.supabaseConnectionStatus === 'connected') {
+            console.log('✅ SUPABASE CONNECTION SUCCESSFUL ON RETRY: API is now ready for storage');
+          }
+        } catch (retryError) {
+          console.error('STARTUP RETRY ERROR:', retryError);
+        }
+      }, 2000); // 2 second delay before retry
     }
   } catch (error) {
     console.error('STARTUP ERROR:', error);
   }
-}, 1000); // 1 second delay
+})();
 
-// Optional: Setup for Vercel queue if available
-let vercelQueue;
-try {
-  // Check if Vercel Queue is available
-  if (isVercel && process.env.ENABLE_VERCEL_QUEUE === 'true') {
-    // This is a dynamic import because the module might not be available
-    import('@vercel/functions').then(({ Queue }) => {
-      if (Queue) {
-        vercelQueue = new Queue('email-validation-tasks');
-        console.log('STARTUP: Vercel Queue initialized successfully');
-      }
-    }).catch(err => {
-      console.log('STARTUP: Vercel Queue not available', { error: err.message });
-    });
-  }
-} catch (error) {
-  console.log('STARTUP: Error initializing Vercel Queue', { error: error.message });
-}
-
+// Main API handler function
 export default async function handler(req, res) {
   // Health check endpoint
   if (req.url && req.url.endsWith('/health')) {
@@ -156,7 +152,7 @@ export default async function handler(req, res) {
       supabaseStatus: emailValidator.supabaseConnectionStatus || 'unknown'
     });
     
-    // First do a quick format check - if invalid, return immediately
+    // Quick invalid format check
     if (!emailValidator.isValidEmailFormat(email)) {
       console.log('VALIDATION: Invalid email format detected');
       
@@ -195,24 +191,19 @@ export default async function handler(req, res) {
     const timeoutPromise = new Promise((_, reject) => {
       setTimeout(() => {
         reject(new Error('Function timeout to prevent Vercel runtime timeout'));
-      }, 8000); // 8 seconds (increased from 5s but still well under Vercel's limit)
+      }, 9000); // 9 seconds (just under Vercel's 10-second limit)
     });
     
     try {
-      // Quick validation steps (format check, typo correction, domain check)
-      // These are fast and synchronous
-      const quickResult = emailValidator.performQuickValidation(email);
-      
       // Log that we're starting validation
-      console.log('VALIDATION: Starting optimized validation process', {
+      console.log('VALIDATION: Starting validation process', {
         email,
         supabaseStatus: emailValidator.supabaseConnectionStatus || 'unknown',
-        zeroBounceEnabled: config.useZeroBounce,
-        hasQueue: !!vercelQueue
+        zeroBounceEnabled: config.useZeroBounce
       });
       
       // Race between validation and timeout
-      // Validation now has split steps that complete faster
+      // NOTE: The updated validateEmail method now saves data synchronously
       const result = await Promise.race([
         emailValidator.validateEmail(email, { 
           skipZeroBounce: !config.useZeroBounce, 
@@ -230,24 +221,6 @@ export default async function handler(req, res) {
         umBounceStatus: result.um_bounce_status
       });
       
-      // If we have a Vercel Queue, queue the background save operation
-      // This ensures it completes even if the function has exited
-      if (vercelQueue && config.useSupabase) {
-        try {
-          await vercelQueue.enqueue({
-            action: 'saveValidation',
-            email: email,
-            validationResult: result
-          });
-          console.log('QUEUE: Successfully queued validation save', { email });
-        } catch (queueError) {
-          console.error('QUEUE_ERROR: Failed to queue validation save', {
-            error: queueError.message,
-            email
-          });
-        }
-      }
-      
       return res.status(200).json(result);
     } catch (error) {
       // Log the error and fall back to quick validation
@@ -258,29 +231,12 @@ export default async function handler(req, res) {
       });
       
       // Get quick validation result as a fallback
-      const quickResult = emailValidator.performQuickValidation(email);
+      const quickResult = emailValidator.quickValidate(email);
       
       console.log('API RESPONSE: Falling back to quick validation result', {
         email,
         fallbackStatus: quickResult.status
       });
-      
-      // Still attempt to queue background save for audit trail
-      if (vercelQueue && config.useSupabase) {
-        try {
-          await vercelQueue.enqueue({
-            action: 'saveValidation',
-            email: email,
-            validationResult: quickResult,
-            isFallback: true
-          });
-          console.log('QUEUE: Queued fallback validation save', { email });
-        } catch (queueError) {
-          console.error('QUEUE_ERROR: Failed to queue fallback save', {
-            error: queueError.message
-          });
-        }
-      }
       
       return res.status(200).json(quickResult);
     }
@@ -347,10 +303,6 @@ async function healthCheck(req, res) {
         nodeEnv: process.env.NODE_ENV || 'not set',
         isVercel: isVercel,
         vercelRegion: process.env.VERCEL_REGION || 'unknown'
-      },
-      queue: {
-        available: !!vercelQueue,
-        enabled: process.env.ENABLE_VERCEL_QUEUE === 'true'
       },
       supabase: {
         status: supabaseStatus,

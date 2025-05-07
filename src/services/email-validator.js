@@ -46,21 +46,23 @@ export class EmailValidationService {
       try {
         console.log('EMAIL_VALIDATOR_INIT: Creating Supabase client with provided configuration');
         
-        // Create with explicit fetch options to prevent timeout
         this.supabase = createClient(
           config.supabase.url,
           config.supabase.key,
           {
-            auth: {
+            auth: { 
               persistSession: false,
               autoRefreshToken: false
             },
             // Add custom fetch with longer timeout
             global: {
+              headers: {
+                'Content-Type': 'application/json'
+              },
               fetch: (...args) => {
                 return fetch(...args, {
                   // Increase timeout significantly
-                  signal: AbortSignal.timeout(10000) // 10 seconds timeout
+                  signal: AbortSignal.timeout(15000) // 15 seconds timeout
                 });
               }
             }
@@ -82,7 +84,7 @@ export class EmailValidationService {
     
     // Timeouts configuration with defaults
     this.timeouts = {
-      supabase: config.timeouts?.supabase || 6000,
+      supabase: config.timeouts?.supabase || 8000,
       zeroBounce: config.timeouts?.zeroBounce || 4000,
       hubspot: config.timeouts?.hubspot || 5000,
       validation: config.timeouts?.validation || 4000, 
@@ -132,10 +134,11 @@ export class EmailValidationService {
       
       // Simpler approach without abort controller for more reliable connection
       try {
-        // Make a simple query - use count() which is faster than returning rows
-        const { count, error } = await this.supabase
+        // Make a simple query that's fast - just check if the table exists
+        const { data, error } = await this.supabase
           .from('contacts')
-          .select('*', { count: 'exact', head: true });
+          .select('id')
+          .limit(1);
         
         if (error) {
           console.error('SUPABASE_CONNECTION_FAILED:', { 
@@ -150,7 +153,7 @@ export class EmailValidationService {
         // Connection successful
         console.log('SUPABASE_CONNECTION_SUCCESSFUL: Successfully connected to Supabase database', {
           tableName: 'contacts',
-          approximateRowCount: count
+          approximateRowCount: data ? data.length : 0
         });
         this.supabaseConnectionStatus = 'connected';
       } catch (innerError) {
@@ -198,13 +201,216 @@ export class EmailValidationService {
     return `${lastSixDigits}${this.clientId}${checkDigit}${this.umessyVersion}`;
   }
   
-  // Step 1: Basic format validation - fast and synchronous  
+  // Non-blocking Supabase check - doesn't throw, returns false on failure
+  async isKnownValidEmail(email) {
+    if (!this.supabaseEnabled || !this.supabase) {
+      console.log('SUPABASE_CHECK: Supabase not enabled, skipping check');
+      return { found: false };
+    }
+
+    try {
+      // Use AbortController and timeout
+      const result = await this.withTimeout(
+        async (signal) => {
+          console.log('SUPABASE_CHECK: Attempting to check if email exists in Supabase', { email });
+          
+          const { data, error } = await this.supabase
+            .from('email_validations')
+            .select('email, um_email_status')
+            .eq('email', email)
+            .abortSignal(signal)
+            .single();
+          
+          if (error && error.code !== 'PGRST116') { // PGRST116 is "No rows returned" error
+            throw error;
+          }
+          
+          const found = !!data;
+          console.log('SUPABASE_CHECK: Completed successfully', { 
+            email, 
+            found, 
+            status: data?.um_email_status || null
+          });
+          
+          return {
+            found,
+            data
+          };
+        },
+        this.timeouts.supabase,
+        'Supabase check timeout'
+      );
+      
+      if (result.found) {
+        console.log('SUPABASE_CHECK: Email found in Supabase database', { email });
+      } else {
+        console.log('SUPABASE_CHECK: Email not found in Supabase database', { email });
+      }
+      
+      return result;
+    } catch (error) {
+      console.error('SUPABASE_GET_ERROR:', { message: error.message, email });
+      return { found: false }; // Continue validation on failure
+    }
+  }
+  
+  // Save validation result to Supabase with improved reliability
+  async saveValidationResult(originalEmail, validationResult) {
+    if (!this.supabaseEnabled || !this.supabase) {
+      console.log('SUPABASE_SAVE: Supabase not enabled, skipping save', {
+        supabaseEnabled: this.supabaseEnabled,
+        supabaseClientExists: !!this.supabase,
+        connectionStatus: this.supabaseConnectionStatus
+      });
+      return { success: false, reason: 'Supabase not enabled' };
+    }
+
+    // First, check our connection status and test if needed
+    if (this.supabaseConnectionStatus === 'pending' || this.supabaseConnectionStatus === 'initializing') {
+      try {
+        console.log('SUPABASE_SAVE: Testing connection before save attempt');
+        await this._testSupabaseConnectionAsync();
+        
+        // If the test succeeded but we still don't have a connected status, wait briefly
+        if (this.supabaseConnectionStatus === 'connected') {
+          console.log('SUPABASE_SAVE: Connection test successful, proceeding with save');
+        } else {
+          console.log('SUPABASE_SAVE: Connection test did not result in connected status', {
+            status: this.supabaseConnectionStatus
+          });
+          return { success: false, reason: 'Connection test failed' };
+        }
+      } catch (error) {
+        console.error('SUPABASE_SAVE: Connection test failed', { error: error.message });
+        return { success: false, reason: 'Connection test error: ' + error.message };
+      }
+    }
+    
+    // Only proceed if we have a confirmed connection
+    if (this.supabaseConnectionStatus !== 'connected') {
+      console.log('SUPABASE_SAVE: Skipping save due to connection status', {
+        connectionStatus: this.supabaseConnectionStatus
+      });
+      return { success: false, reason: 'Supabase not connected' };
+    }
+
+    try {
+      console.log('SUPABASE_SAVE: Starting save operation for email', { email: originalEmail });
+      
+      // Create a check ID for this validation if not already present
+      const umCheckId = validationResult.um_check_id || this.generateUmCheckId();
+      const now = new Date();
+      
+      // Map validation status to um_email_status and um_bounce_status
+      let umEmailStatus = validationResult.um_email_status || 'Unable to change';
+      let umBounceStatus = validationResult.um_bounce_status || 'Unknown';
+      
+      if (!validationResult.um_email_status) {
+        if (validationResult.wasCorrected) {
+          umEmailStatus = 'Changed';
+        } else {
+          umEmailStatus = 'Unchanged';
+        }
+      }
+      
+      if (!validationResult.um_bounce_status) {
+        if (validationResult.status === 'valid') {
+          umBounceStatus = 'Unlikely to bounce';
+        } else if (validationResult.status === 'invalid') {
+          umBounceStatus = 'Likely to bounce';
+        }
+      }
+      
+      // First, create a contact - use a simpler approach to avoid transaction issues
+      console.log('SUPABASE_SAVE: Creating new contact');
+      let contactId;
+      
+      try {
+        // Direct insert without transaction for better reliability
+        const { data: newContact, error: createContactError } = await this.supabase
+          .from('contacts')
+          .insert({})
+          .select('id')
+          .single();
+          
+        if (createContactError) {
+          console.error('SUPABASE_SAVE_ERROR: Failed to create contact', {
+            error: createContactError.message,
+            code: createContactError.code
+          });
+          throw new Error(`Failed to create contact: ${createContactError.message}`);
+        }
+        
+        contactId = newContact.id;
+        console.log('SUPABASE_SAVE: Created new contact', { contactId });
+      } catch (contactError) {
+        console.error('SUPABASE_SAVE_ERROR: Exception creating contact', { error: contactError.message });
+        throw contactError;
+      }
+      
+      // Now insert the email validation record
+      const validationData = {
+        contact_id: contactId,
+        date_last_um_check: validationResult.date_last_um_check || now.toISOString(),
+        date_last_um_check_epoch: validationResult.date_last_um_check_epoch || Math.floor(now.getTime() / 1000),
+        um_check_id: umCheckId,
+        um_email: validationResult.currentEmail || validationResult.um_email || originalEmail,
+        email: originalEmail,
+        um_email_status: umEmailStatus,
+        um_bounce_status: umBounceStatus
+      };
+      
+      try {
+        console.log('SUPABASE_SAVE: Creating new validation record', {
+          contactId,
+          email: originalEmail,
+          umEmail: validationData.um_email
+        });
+        
+        const { data, error } = await this.supabase
+          .from('email_validations')
+          .insert(validationData)
+          .select()
+          .single();
+          
+        if (error) {
+          console.error('SUPABASE_SAVE_ERROR: Failed to insert validation record', {
+            error: error.message,
+            code: error.code
+          });
+          throw new Error(`Failed to insert validation record: ${error.message}`);
+        }
+        
+        console.log('SUPABASE_SAVE: Successfully saved validation result', {
+          email: originalEmail,
+          operation: 'insert',
+          id: data.id
+        });
+        
+        return { success: true, operation: 'insert', data };
+      } catch (validationError) {
+        console.error('SUPABASE_SAVE_ERROR: Exception creating validation record', { 
+          error: validationError.message 
+        });
+        throw validationError;
+      }
+    } catch (error) {
+      console.error('SUPABASE_SAVE_ERROR:', { 
+        message: error.message, 
+        stack: error.stack,
+        email: originalEmail 
+      });
+      return { success: false, error: error.message };
+    }
+  }
+  
+  // Basic format validation - fast and synchronous  
   isValidEmailFormat(email) {
     const emailRegex = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
     return emailRegex.test(email);
   }
   
-  // Step 2: Typo correction - fast and synchronous
+  // Typo correction - fast and synchronous
   correctEmailTypos(email) {
     if (!email) {
       return { corrected: false, email };
@@ -252,7 +458,7 @@ export class EmailValidationService {
     return { corrected, email: cleanedEmail };
   }
   
-  // Step 3: Domain check - fast and synchronous
+  // Fast domain check - synchronous
   isValidDomain(email) {
     try {
       const domain = email.split('@')[1];
@@ -264,7 +470,7 @@ export class EmailValidationService {
   }
   
   // Fast local validation without external services
-  performQuickValidation(email) {
+  quickValidate(email) {
     // Step 1: Format check
     const formatValid = this.isValidEmailFormat(email);
     if (!formatValid) {
@@ -319,60 +525,7 @@ export class EmailValidationService {
     };
   }
   
-  // Step 4: Check if email exists in Supabase - non-blocking
-  async checkExistingValidation(email) {
-    if (!this.supabaseEnabled || !this.supabase) {
-      console.log('SUPABASE_CHECK: Supabase not enabled, skipping check');
-      return { found: false };
-    }
-
-    try {
-      // Use AbortController and timeout
-      const result = await this.withTimeout(
-        async (signal) => {
-          console.log('SUPABASE_CHECK: Attempting to check if email exists in Supabase', { email });
-          
-          const { data, error } = await this.supabase
-            .from('email_validations')
-            .select('email, um_email_status, um_bounce_status, date_last_um_check, date_last_um_check_epoch, um_check_id')
-            .eq('email', email)
-            .abortSignal(signal)
-            .single();
-          
-          if (error && error.code !== 'PGRST116') { // PGRST116 is "No rows returned" error
-            throw error;
-          }
-          
-          const found = !!data;
-          console.log('SUPABASE_CHECK: Completed successfully', { 
-            email, 
-            found, 
-            status: data?.um_email_status || null
-          });
-          
-          return {
-            found,
-            data
-          };
-        },
-        this.timeouts.supabase,
-        'Supabase check timeout'
-      );
-      
-      if (result.found) {
-        console.log('SUPABASE_CHECK: Email found in Supabase database', { email });
-      } else {
-        console.log('SUPABASE_CHECK: Email not found in Supabase database', { email });
-      }
-      
-      return result;
-    } catch (error) {
-      console.error('SUPABASE_GET_ERROR:', { message: error.message, email });
-      return { found: false }; // Continue validation on failure
-    }
-  }
-  
-  // Step 5: ZeroBounce check with proper timeout handling
+  // ZeroBounce check with proper timeout handling and did_you_mean handling
   async checkWithZeroBounce(email) {
     if (!this.config.zeroBounceApiKey || this.config.useZeroBounce === false) {
       console.log('ZEROBOUNCE_CHECK: ZeroBounce not configured or disabled, skipping check');
@@ -511,140 +664,8 @@ export class EmailValidationService {
     }
   }
   
-  // Step 6: Save validation result to Supabase (background job)
-  async saveValidationResult(originalEmail, validationResult) {
-    // This method is now designed to be called asynchronously
-    if (!this.supabaseEnabled || !this.supabase) {
-      console.log('SUPABASE_SAVE: Supabase not enabled, skipping save', {
-        supabaseEnabled: this.supabaseEnabled,
-        supabaseClientExists: !!this.supabase,
-        connectionStatus: this.supabaseConnectionStatus
-      });
-      return { success: false, reason: 'Supabase not enabled' };
-    }
-
-    try {
-      console.log('SUPABASE_SAVE: Starting save operation for email', { email: originalEmail });
-      
-      // First, check our connection status and test if needed
-      if (this.supabaseConnectionStatus === 'pending') {
-        try {
-          console.log('SUPABASE_SAVE: Testing connection before first save attempt');
-          await this._testSupabaseConnectionAsync();
-        } catch (error) {
-          console.error('SUPABASE_SAVE: Connection test failed', { error: error.message });
-        }
-      }
-      
-      if (this.supabaseConnectionStatus !== 'connected') {
-        console.log('SUPABASE_SAVE: Skipping save due to connection status', {
-          connectionStatus: this.supabaseConnectionStatus
-        });
-        return { success: false, reason: 'Supabase not connected' };
-      }
-      
-      // Create a check ID for this validation if not already present
-      const umCheckId = validationResult.um_check_id || this.generateUmCheckId();
-      const now = new Date();
-      
-      // Map validation status to um_email_status and um_bounce_status
-      let umEmailStatus = validationResult.um_email_status || 'Unable to change';
-      let umBounceStatus = validationResult.um_bounce_status || 'Unknown';
-      
-      if (!validationResult.um_email_status) {
-        if (validationResult.wasCorrected) {
-          umEmailStatus = 'Changed';
-        } else {
-          umEmailStatus = 'Unchanged';
-        }
-      }
-      
-      if (!validationResult.um_bounce_status) {
-        if (validationResult.status === 'valid') {
-          umBounceStatus = 'Unlikely to bounce';
-        } else if (validationResult.status === 'invalid') {
-          umBounceStatus = 'Likely to bounce';
-        }
-      }
-      
-      // First, create a contact
-      console.log('SUPABASE_SAVE: Creating new contact');
-      let contactId;
-      
-      try {
-        const { data: newContact, error: createContactError } = await this.supabase
-          .from('contacts')
-          .insert({})
-          .select('id')
-          .single();
-          
-        if (createContactError) {
-          console.error('SUPABASE_SAVE_ERROR: Failed to create contact', {
-            error: createContactError.message,
-            code: createContactError.code
-          });
-          throw new Error(`Failed to create contact: ${createContactError.message}`);
-        }
-        
-        contactId = newContact.id;
-        console.log('SUPABASE_SAVE: Created new contact', { contactId });
-      } catch (contactError) {
-        console.error('SUPABASE_SAVE_ERROR: Exception creating contact', { error: contactError.message });
-        throw contactError;
-      }
-      
-      // Now insert the email validation record
-      const validationData = {
-        contact_id: contactId,
-        date_last_um_check: validationResult.date_last_um_check || now.toISOString(),
-        date_last_um_check_epoch: validationResult.date_last_um_check_epoch || Math.floor(now.getTime() / 1000),
-        um_check_id: umCheckId,
-        um_email: validationResult.currentEmail || validationResult.um_email || originalEmail,
-        email: originalEmail,
-        um_email_status: umEmailStatus,
-        um_bounce_status: umBounceStatus
-      };
-      
-      try {
-        console.log('SUPABASE_SAVE: Creating new validation record');
-        const { data, error } = await this.supabase
-          .from('email_validations')
-          .insert(validationData)
-          .select()
-          .single();
-          
-        if (error) {
-          console.error('SUPABASE_SAVE_ERROR: Failed to insert validation record', {
-            error: error.message,
-            code: error.code
-          });
-          throw new Error(`Failed to insert validation record: ${error.message}`);
-        }
-        
-        console.log('SUPABASE_SAVE: Successfully saved validation result', {
-          email: originalEmail,
-          operation: 'insert',
-          id: data.id
-        });
-        
-        return { success: true, operation: 'insert', data };
-      } catch (validationError) {
-        console.error('SUPABASE_SAVE_ERROR: Exception creating validation record', { 
-          error: validationError.message 
-        });
-        throw validationError;
-      }
-    } catch (error) {
-      console.error('SUPABASE_SAVE_ERROR:', { 
-        message: error.message, 
-        stack: error.stack,
-        email: originalEmail 
-      });
-      return { success: false, error: error.message };
-    }
-  }
-  
-  // Core validation process - split into steps for better performance
+  // Save data synchronously during the validation process
+  // This is a critical change to fix the data saving issue
   async validateEmail(email, options = {}) {
     const { skipZeroBounce = false, timeoutMs = this.timeouts.validation, isRetry = false } = options;
     
@@ -656,8 +677,8 @@ export class EmailValidationService {
       supabaseStatus: this.supabaseConnectionStatus
     });
     
-    // STEP 1-3: Fast synchronous validation
-    const quickResult = this.performQuickValidation(email);
+    // Start with quick validation (synchronous, always works)
+    const quickResult = this.quickValidate(email);
     
     // If format is invalid, return immediately
     if (!quickResult.formatValid) {
@@ -665,33 +686,25 @@ export class EmailValidationService {
       return quickResult;
     }
     
+    // Set a global timeout for the entire validation process
     try {
       console.log('VALIDATION_PROCESS: Starting advanced validation checks');
       
-      // STEP 4-5: External validation (Supabase + ZeroBounce) with timeout
       const result = await this.withTimeout(
         async () => {
-          // Execute partial and potentially slower checks in parallel
+          // Log the process
           console.log('VALIDATION_PROCESS: Running Supabase and ZeroBounce checks in parallel');
           
-          // STEP 4: Check if we already have validation data for this email
-          const knownValidPromise = this.checkExistingValidation(quickResult.currentEmail);
-          
-          // STEP 5: Check with ZeroBounce (only if not skipped)
-          const zeroBouncePromise = skipZeroBounce ? 
-            Promise.resolve(null) : 
-            this.checkWithZeroBounce(quickResult.currentEmail);
-          
-          // Run checks in parallel
+          // Run Supabase check and ZeroBounce check in parallel
           const [knownValidResult, zeroBounceResult] = await Promise.allSettled([
-            knownValidPromise,
-            zeroBouncePromise
+            this.isKnownValidEmail(quickResult.currentEmail),
+            skipZeroBounce ? null : this.checkWithZeroBounce(quickResult.currentEmail)
           ]);
           
           // Start with the quick result and enhance it
           const result = { ...quickResult };
           
-          // STEP 4 RESULT: Add Supabase result if successful
+          // Add Supabase result if successful
           if (knownValidResult.status === 'fulfilled' && knownValidResult.value.found) {
             console.log('VALIDATION_PROCESS: Email found in Supabase database, marking as valid', { 
               email: quickResult.currentEmail 
@@ -735,7 +748,7 @@ export class EmailValidationService {
             });
           }
           
-          // STEP 5 RESULT: Process ZeroBounce result
+          // Check ZeroBounce result and process any suggested email
           if (!skipZeroBounce && zeroBounceResult?.status === 'fulfilled' && zeroBounceResult.value) {
             const bounceCheck = zeroBounceResult.value;
             
@@ -746,7 +759,7 @@ export class EmailValidationService {
               suggestedEmail: bounceCheck.suggestedEmail
             });
             
-            // Handle suggested email from ZeroBounce
+            // Check for suggested email from ZeroBounce
             if (bounceCheck.suggestedEmail && !isRetry) {
               console.log('VALIDATION_PROCESS: ZeroBounce suggested an email correction, revalidating', {
                 originalEmail: email,
@@ -779,19 +792,6 @@ export class EmailValidationService {
                 suggestedEmail: bounceCheck.suggestedEmail,
                 finalStatus: suggestedEmailResult.status
               });
-              
-              // STEP 6: Save the validation result in background (don't await)
-              if (this.supabaseEnabled) {
-                // Don't block the response on this save
-                this.queueBackgroundTask(() => {
-                  this.saveValidationResult(email, suggestedEmailResult).catch((err) => {
-                    console.error('VALIDATION_PROCESS: Error in background save of suggested email', {
-                      error: err.message,
-                      email: email
-                    });
-                  });
-                });
-              }
               
               return suggestedEmailResult;
             }
@@ -831,16 +831,22 @@ export class EmailValidationService {
             recheckNeeded: result.recheckNeeded
           });
           
-          // STEP 6: Queue background save operation (don't await or block response)
+          // CRITICAL FIX: Save to Supabase synchronously during validation process
+          // This ensures the save completes before the function terminates
           if (this.supabaseEnabled) {
-            this.queueBackgroundTask(() => {
-              this.saveValidationResult(email, result).catch((err) => {
-                console.error('VALIDATION_PROCESS: Error in background save', {
-                  error: err.message,
-                  email: email
-                });
+            try {
+              console.log('VALIDATION_PROCESS: Starting synchronous save to Supabase');
+              const saveResult = await this.saveValidationResult(email, result);
+              console.log('VALIDATION_PROCESS: Supabase save completed', { 
+                success: saveResult.success,
+                operation: saveResult.operation,
+                dataId: saveResult.data?.id || 'none'
               });
-            });
+            } catch (saveError) {
+              console.error('VALIDATION_PROCESS: Error during synchronous save', {
+                error: saveError.message
+              });
+            }
           }
           
           return result;
@@ -854,29 +860,21 @@ export class EmailValidationService {
       console.error('VALIDATION_TIMEOUT:', { message: error.message, email });
       console.log('VALIDATION_PROCESS: Using quick validation result as fallback due to timeout');
       
-      // Try to save quick result to Supabase in background (don't block)
+      // Try to save quick result to Supabase synchronously
       if (this.supabaseEnabled) {
-        this.queueBackgroundTask(() => {
-          this.saveValidationResult(email, quickResult).catch(() => {});
-        });
+        try {
+          console.log('VALIDATION_PROCESS: Saving fallback result to Supabase');
+          await this.saveValidationResult(email, quickResult);
+        } catch (saveError) {
+          console.error('VALIDATION_PROCESS: Error saving fallback result', {
+            error: saveError.message
+          });
+        }
       }
       
       // Return quick result on timeout
       return quickResult;
     }
-  }
-  
-  // Background task queue helper - prevents blocking main function
-  queueBackgroundTask(taskFn) {
-    // In a serverless environment, we need to be careful with this
-    // This is a simple implementation that just runs the task asynchronously
-    setTimeout(() => {
-      try {
-        taskFn();
-      } catch (error) {
-        console.error('BACKGROUND_TASK_ERROR:', error);
-      }
-    }, 0);
   }
   
   // Batch validation with time budget management
@@ -898,7 +896,7 @@ export class EmailValidationService {
       if (remainingTimeMs < timeoutPerEmailMs / 2) {
         // Process remaining emails with quick validation
         for (let j = i; j < emails.length; j++) {
-          results.push(this.performQuickValidation(emails[j]));
+          results.push(this.quickValidate(emails[j]));
         }
         break;
       }
@@ -913,7 +911,7 @@ export class EmailValidationService {
         results.push(result);
       } catch (error) {
         // Fall back to quick validation
-        results.push(this.performQuickValidation(email));
+        results.push(this.quickValidate(email));
       }
     }
     
