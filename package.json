@@ -5,15 +5,15 @@
   "type": "module",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "nodemon api/validate/email.js"
+    "dev": "nodemon api/validate/email.js",
+    "start": "node api/validate/email.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "Email validation service with Supabase integration",
   "dependencies": {
-    "@supabase/supabase-js": "^2.49.4",
-    "@upstash/redis": "^1.34.8",
+    "@supabase/supabase-js": "^2.39.4",
     "dotenv": "^16.5.0"
   },
   "devDependencies": {
