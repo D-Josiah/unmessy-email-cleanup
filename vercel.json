@@ -10,6 +10,12 @@
       }
     }
   ],
+  "functions": {
+    "api/**/*.js": {
+      "memory": 4096,
+      "maxDuration": 60
+    }
+  },
   "routes": [
     { "src": "/api/health", "dest": "/api/health.js" },
     { "src": "/api/webhooks/hubspot", "dest": "/api/webhooks/hubspot.js" },
