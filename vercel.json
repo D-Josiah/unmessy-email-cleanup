@@ -1,12 +1,15 @@
 {
   "version": 2,
   "regions": ["syd1"], 
-  "functions": {
-    "api/**/*.js": {
-      "memory": 4096,
-      "maxDuration": 60
+  "builds": [
+    { 
+      "src": "api/**/*.js", 
+      "use": "@vercel/node",
+      "config": { 
+        "includeFiles": ["src/**"] 
+      }
     }
-  },
+  ],
   "routes": [
     { "src": "/api/health", "dest": "/api/health.js" },
     { "src": "/api/webhooks/hubspot", "dest": "/api/webhooks/hubspot.js" },
