@@ -260,6 +260,16 @@ export class EmailValidationService {
   
   // Save validation result to Supabase with improved reliability
   async saveValidationResult(originalEmail, validationResult, clientId = null) {
+    // Only proceed if the email is valid
+    if (validationResult.status !== 'valid') {
+      console.log('SUPABASE_SAVE: Skipping save for invalid email', {
+        email: originalEmail,
+        status: validationResult.status,
+        clientId: clientId || 'default'
+      });
+      return { success: false, reason: 'Email is not valid', status: validationResult.status };
+    }
+    
     if (!this.supabaseEnabled || !this.supabase) {
       console.log('SUPABASE_SAVE: Supabase not enabled, skipping save', {
         supabaseEnabled: this.supabaseEnabled,
@@ -299,7 +309,7 @@ export class EmailValidationService {
     }
 
     try {
-      console.log('SUPABASE_SAVE: Starting save operation for email', { 
+      console.log('SUPABASE_SAVE: Starting save operation for valid email', { 
         email: originalEmail,
         clientId: clientId || 'default'
       });
@@ -923,9 +933,10 @@ export class EmailValidationService {
           
           // CRITICAL FIX: Save to Supabase synchronously during validation process
           // This ensures the save completes before the function terminates
-          if (this.supabaseEnabled) {
+          // Only save if the email is valid (saveValidationResult will check this too)
+          if (this.supabaseEnabled && result.status === 'valid') {
             try {
-              console.log('VALIDATION_PROCESS: Starting synchronous save to Supabase');
+              console.log('VALIDATION_PROCESS: Starting synchronous save to Supabase for valid email');
               const saveResult = await this.saveValidationResult(email, result, clientId);
               console.log('VALIDATION_PROCESS: Supabase save completed', { 
                 success: saveResult.success,
@@ -939,6 +950,11 @@ export class EmailValidationService {
                 clientId: clientId || 'default'
               });
             }
+          } else if (this.supabaseEnabled) {
+            console.log('VALIDATION_PROCESS: Skipping save for non-valid email', {
+              email: originalEmail,
+              status: result.status
+            });
           }
           
           return result;
@@ -956,8 +972,8 @@ export class EmailValidationService {
       });
       console.log('VALIDATION_PROCESS: Using quick validation result as fallback due to timeout');
       
-      // Try to save quick result to Supabase synchronously
-      if (this.supabaseEnabled) {
+      // Try to save quick result to Supabase synchronously if it's valid
+      if (this.supabaseEnabled && quickResult.status === 'valid') {
         try {
           console.log('VALIDATION_PROCESS: Saving fallback result to Supabase');
           await this.saveValidationResult(email, quickResult, clientId);
@@ -967,6 +983,11 @@ export class EmailValidationService {
             clientId: clientId || 'default'
           });
         }
+      } else if (this.supabaseEnabled) {
+        console.log('VALIDATION_PROCESS: Skipping save for fallback non-valid email', {
+          email,
+          status: quickResult.status
+        });
       }
       
       // Return quick result on timeout
