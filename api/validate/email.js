@@ -227,6 +227,24 @@ export default async function handler(req, res) {
         um_bounce_status: 'Likely to bounce'
       };
       
+      // Increment the client's email count even for invalid emails
+      clientManager.incrementEmailCount(client.clientId);
+      
+      // Get client stats for the response
+      const clientStats = clientManager.getClientStats(client.clientId);
+      
+      // Add client information to the result
+      const responseWithClientInfo = {
+        ...result,
+        client: {
+          id: client.clientId,
+          name: client.name,
+          emailCount: clientStats.usage.emailCount,
+          emailLimit: client.dailyEmailLimit,
+          remaining: client.dailyEmailLimit - clientStats.usage.emailCount
+        }
+      };
+      
       // Log the result before returning
       console.log('API RESPONSE: Returning invalid format result', {
         clientId: client.clientId,
@@ -235,10 +253,7 @@ export default async function handler(req, res) {
         subStatus: result.subStatus
       });
       
-      // Increment the client's email count even for invalid emails
-      clientManager.incrementEmailCount(client.clientId);
-      
-      return res.status(200).json(result);
+      return res.status(200).json(responseWithClientInfo);
     }
     
     // Set a strict global timeout to ensure we respond before Vercel's timeout
@@ -271,6 +286,21 @@ export default async function handler(req, res) {
       // Increment the client's email count for successful validation
       clientManager.incrementEmailCount(client.clientId);
       
+      // Get client stats for the response
+      const clientStats = clientManager.getClientStats(client.clientId);
+      
+      // Add client information to the result
+      const responseWithClientInfo = {
+        ...result,
+        client: {
+          id: client.clientId,
+          name: client.name,
+          emailCount: clientStats.usage.emailCount,
+          emailLimit: client.dailyEmailLimit,
+          remaining: client.dailyEmailLimit - clientStats.usage.emailCount
+        }
+      };
+      
       // Log success and return result
       console.log('API RESPONSE: Validation completed successfully', {
         clientId: client.clientId,
@@ -278,10 +308,15 @@ export default async function handler(req, res) {
         status: result.status,
         wasCorrected: result.wasCorrected,
         umEmailStatus: result.um_email_status,
-        umBounceStatus: result.um_bounce_status
+        umBounceStatus: result.um_bounce_status,
+        usageStats: {
+          count: clientStats.usage.emailCount,
+          limit: client.dailyEmailLimit,
+          remaining: client.dailyEmailLimit - clientStats.usage.emailCount
+        }
       });
       
-      return res.status(200).json(result);
+      return res.status(200).json(responseWithClientInfo);
     } catch (error) {
       // Log the error and fall back to quick validation
       console.error('VALIDATION ERROR: Validation timed out or failed', {
@@ -297,13 +332,33 @@ export default async function handler(req, res) {
       // Increment the client's email count even for fallback results
       clientManager.incrementEmailCount(client.clientId);
       
+      // Get client stats for the response
+      const clientStats = clientManager.getClientStats(client.clientId);
+      
+      // Add client information to the result
+      const responseWithClientInfo = {
+        ...quickResult,
+        client: {
+          id: client.clientId,
+          name: client.name,
+          emailCount: clientStats.usage.emailCount,
+          emailLimit: client.dailyEmailLimit,
+          remaining: client.dailyEmailLimit - clientStats.usage.emailCount
+        }
+      };
+      
       console.log('API RESPONSE: Falling back to quick validation result', {
         clientId: client.clientId,
         email,
-        fallbackStatus: quickResult.status
+        fallbackStatus: quickResult.status,
+        usageStats: {
+          count: clientStats.usage.emailCount,
+          limit: client.dailyEmailLimit,
+          remaining: client.dailyEmailLimit - clientStats.usage.emailCount
+        }
       });
       
-      return res.status(200).json(quickResult);
+      return res.status(200).json(responseWithClientInfo);
     }
   } catch (error) {
     // Log the fatal error
