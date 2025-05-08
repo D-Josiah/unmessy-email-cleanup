@@ -259,11 +259,11 @@ export class EmailValidationService {
   }
   
   // Save validation result to Supabase with improved reliability
-  async saveValidationResult(originalEmail, validationResult, clientId = null) {
+  async saveValidationResult(email, validationResult, clientId = null) {
     // Only proceed if the email is valid
     if (validationResult.status !== 'valid') {
       console.log('SUPABASE_SAVE: Skipping save for invalid email', {
-        email: originalEmail,
+        email: email,
         status: validationResult.status,
         clientId: clientId || 'default'
       });
@@ -310,7 +310,7 @@ export class EmailValidationService {
 
     try {
       console.log('SUPABASE_SAVE: Starting save operation for valid email', { 
-        email: originalEmail,
+        email: email,
         clientId: clientId || 'default'
       });
       
@@ -339,12 +339,12 @@ export class EmailValidationService {
       }
       
       // First, check if the email already exists in the database
-      console.log('SUPABASE_SAVE: Checking if email already exists in database', { email: originalEmail });
+      console.log('SUPABASE_SAVE: Checking if email already exists in database', { email: email });
       
       const { data: existingRecord, error: searchError } = await this.supabase
         .from('email_validations')
         .select('id, contact_id')
-        .eq('email', originalEmail)
+        .eq('email', email)
         .maybeSingle();
         
       if (searchError && searchError.code !== 'PGRST116') { // PGRST116 is "No rows returned" error
@@ -358,7 +358,7 @@ export class EmailValidationService {
       // If email exists, update the existing record
       if (existingRecord) {
         console.log('SUPABASE_SAVE: Email found in database, updating existing record', {
-          email: originalEmail,
+          email: email,
           recordId: existingRecord.id,
           contactId: existingRecord.contact_id
         });
@@ -368,7 +368,7 @@ export class EmailValidationService {
           date_last_um_check: validationResult.date_last_um_check || now.toISOString(),
           date_last_um_check_epoch: validationResult.date_last_um_check_epoch || Math.floor(now.getTime() / 1000),
           um_check_id: umCheckId,
-          um_email: validationResult.currentEmail || validationResult.um_email || originalEmail,
+          um_email: validationResult.currentEmail || validationResult.um_email || email,
           um_email_status: umEmailStatus,
           um_bounce_status: umBounceStatus
         };
@@ -390,7 +390,7 @@ export class EmailValidationService {
         }
         
         console.log('SUPABASE_SAVE: Successfully updated existing record', {
-          email: originalEmail,
+          email: email,
           operation: 'update',
           id: updatedRecord.id,
           clientId: clientId || 'default'
@@ -435,8 +435,8 @@ export class EmailValidationService {
         date_last_um_check: validationResult.date_last_um_check || now.toISOString(),
         date_last_um_check_epoch: validationResult.date_last_um_check_epoch || Math.floor(now.getTime() / 1000),
         um_check_id: umCheckId,
-        um_email: validationResult.currentEmail || validationResult.um_email || originalEmail,
-        email: originalEmail,
+        um_email: validationResult.currentEmail || validationResult.um_email || email,
+        email: email,
         um_email_status: umEmailStatus,
         um_bounce_status: umBounceStatus
       };
@@ -444,7 +444,7 @@ export class EmailValidationService {
       try {
         console.log('SUPABASE_SAVE: Creating new validation record', {
           contactId,
-          email: originalEmail,
+          email: email,
           umEmail: validationData.um_email,
           clientId: clientId || 'default'
         });
@@ -464,7 +464,7 @@ export class EmailValidationService {
         }
         
         console.log('SUPABASE_SAVE: Successfully saved validation result', {
-          email: originalEmail,
+          email: email,
           operation: 'insert',
           id: data.id,
           clientId: clientId || 'default'
@@ -481,7 +481,7 @@ export class EmailValidationService {
       console.error('SUPABASE_SAVE_ERROR:', { 
         message: error.message, 
         stack: error.stack,
-        email: originalEmail 
+        email: email
       });
       return { success: false, error: error.message };
     }
@@ -952,7 +952,7 @@ export class EmailValidationService {
             }
           } else if (this.supabaseEnabled) {
             console.log('VALIDATION_PROCESS: Skipping save for non-valid email', {
-              email: originalEmail,
+              email: email,
               status: result.status
             });
           }
@@ -985,7 +985,7 @@ export class EmailValidationService {
         }
       } else if (this.supabaseEnabled) {
         console.log('VALIDATION_PROCESS: Skipping save for fallback non-valid email', {
-          email,
+          email: email,
           status: quickResult.status
         });
       }
@@ -994,200 +994,3 @@ export class EmailValidationService {
       return quickResult;
     }
   }
-  
-  // Batch validation with time budget management
-  async validateBatch(emails, options = {}) {
-    const { 
-      skipZeroBounce = false, 
-      timeoutPerEmailMs = 2000,
-      clientId = null  // New parameter to track which client made the request
-    } = options;
-    
-    console.log('BATCH_VALIDATION: Starting batch validation', { 
-      batchSize: emails.length,
-      clientId: clientId || 'default'
-    });
-    
-    const results = [];
-    const batchStartTime = Date.now();
-    const totalBatchTimeoutMs = Math.min(9000, emails.length * timeoutPerEmailMs);
-    
-    for (let i = 0; i < emails.length; i++) {
-      const email = emails[i];
-      
-      // Calculate remaining time budget
-      const elapsedTime = Date.now() - batchStartTime;
-      const remainingTimeMs = totalBatchTimeoutMs - elapsedTime;
-      
-      // If we're running out of time, use quick validation for remaining emails
-      if (remainingTimeMs < timeoutPerEmailMs / 2) {
-        console.log('BATCH_VALIDATION: Running out of time, using quick validation for remaining emails', {
-          processed: i,
-          remaining: emails.length - i,
-          remainingTimeMs
-        });
-        
-        // Process remaining emails with quick validation
-        for (let j = i; j < emails.length; j++) {
-          results.push(this.quickValidate(emails[j], clientId));
-        }
-        break;
-      }
-      
-      try {
-        // Validate with appropriate timeout
-        const result = await this.validateEmail(email, {
-          skipZeroBounce,
-          timeoutMs: Math.min(remainingTimeMs, timeoutPerEmailMs),
-          clientId
-        });
-        
-        results.push(result);
-      } catch (error) {
-        console.error('BATCH_VALIDATION_ERROR:', {
-          email,
-          error: error.message,
-          clientId: clientId || 'default'
-        });
-        
-        // Fall back to quick validation
-        results.push(this.quickValidate(email, clientId));
-      }
-    }
-    
-    console.log('BATCH_VALIDATION: Completed batch validation', {
-      batchSize: emails.length,
-      resultsCount: results.length,
-      clientId: clientId || 'default'
-    });
-    
-    return results;
-  }
-  
-  // Update HubSpot contact with proper timeout handling
-  async updateHubSpotContact(contactId, validationResult, clientId = null) {
-    console.log('HUBSPOT_UPDATE: Starting contact update', {
-      contactId,
-      validationStatus: validationResult.status,
-      email: validationResult.currentEmail,
-      clientId: clientId || 'default'
-    });
-    
-    if (!this.config.hubspot?.apiKey) {
-      console.error('HUBSPOT_UPDATE: API key not configured');
-      return {
-        success: false,
-        contactId,
-        error: 'HubSpot API key not configured'
-      };
-    }
-
-    try {
-      console.log('HUBSPOT_UPDATE: Preparing properties for update');
-      
-      return await this.withTimeout(
-        async (signal) => {
-          // Prepare properties to update
-          const properties = {
-            email: validationResult.currentEmail,
-            email_status: validationResult.status,
-            email_recheck_needed: validationResult.recheckNeeded,
-            email_check_date: new Date().toISOString(),
-            
-            // Include Unmessy specific fields
-            um_email_status: validationResult.um_email_status,
-            um_bounce_status: validationResult.um_bounce_status,
-            date_last_um_check: validationResult.date_last_um_check,
-            um_check_id: validationResult.um_check_id,
-            
-            // Add client ID that performed the validation
-            validation_client_id: clientId || this.clientId
-          };
-          
-          // Add original email if corrected (either by built-in corrections or ZeroBounce suggestion)
-          if (validationResult.wasCorrected) {
-            properties.original_email = validationResult.originalEmail;
-            properties.email_corrected = true;
-            
-            // If correction was due to ZeroBounce suggestion, add that info
-            if (validationResult.validationSteps?.some(step => step.step === 'zerobounce_suggestion')) {
-              properties.email_correction_source = 'zerobounce';
-              
-              const suggestionStep = validationResult.validationSteps?.find(
-                step => step.step === 'zerobounce_suggestion'
-              );
-              
-              if (suggestionStep) {
-                properties.email_suggested_by_zerobounce = true;
-                properties.email_suggestion_original = suggestionStep.original;
-              }
-            } else {
-              properties.email_correction_source = 'internal';
-            }
-          }
-          
-          if (validationResult.subStatus) {
-            properties.email_sub_status = validationResult.subStatus;
-          }
-          
-          console.log('HUBSPOT_UPDATE: Sending update request', {
-            contactId,
-            properties: Object.keys(properties).join(', '),
-            clientId: clientId || 'default'
-          });
-          
-          // Send update request
-          const response = await fetch(
-            `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}`,
-            {
-              method: 'PATCH',
-              headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${this.config.hubspot.apiKey}`
-              },
-              body: JSON.stringify({ properties }),
-              signal
-            }
-          );
-          
-          console.log('HUBSPOT_UPDATE: Received response', {
-            contactId,
-            status: response.status,
-            statusText: response.statusText
-          });
-          
-          if (!response.ok) {
-            throw new Error(`HubSpot API error: ${response.status} ${response.statusText}`);
-          }
-          
-          const data = await response.json();
-          
-          console.log('HUBSPOT_UPDATE: Successfully updated contact', {
-            contactId,
-            responseId: data.id,
-            clientId: clientId || 'default'
-          });
-          
-          return {
-            success: true,
-            contactId,
-            hubspotResponse: data
-          };
-        },
-        this.timeouts.hubspot,
-        'HubSpot update timeout'
-      );
-    } catch (error) {
-      console.error('HUBSPOT_UPDATE_ERROR:', { 
-        message: error.message, 
-        contactId,
-        clientId: clientId || 'default'
-      });
-      return {
-        success: false,
-        contactId,
-        error: error.message
-      };
-    }
-  }
-}
