@@ -87,7 +87,6 @@ export class EmailValidationService {
     this.timeouts = {
       supabase: config.timeouts?.supabase || 8000,
       zeroBounce: config.timeouts?.zeroBounce || 4000,
-      hubspot: config.timeouts?.hubspot || 5000,
       validation: config.timeouts?.validation || 4000, 
       webhook: config.timeouts?.webhook || 6000
     };
@@ -606,7 +605,7 @@ export class EmailValidationService {
           contactId: existingRecord.contact_id
         });
         
-        // Prepare update data - REMOVED client_id field
+        // Prepare update data
         const updateData = {
           date_last_um_check: validationResult.date_last_um_check || now.toISOString(),
           date_last_um_check_epoch: validationResult.date_last_um_check_epoch || Math.floor(now.getTime() / 1000),
@@ -672,7 +671,7 @@ export class EmailValidationService {
         throw contactError;
       }
       
-      // Now insert the email validation record - REMOVED client_id field
+      // Now insert the email validation record
       const validationData = {
         contact_id: contactId,
         date_last_um_check: validationResult.date_last_um_check || now.toISOString(),
@@ -1398,132 +1397,5 @@ export class EmailValidationService {
     });
     
     return results;
-  }
-  
-  // Update HubSpot contact with proper timeout handling
-  async updateHubSpotContact(contactId, validationResult, clientId = null) {
-    console.log('HUBSPOT_UPDATE: Starting contact update', {
-      contactId,
-      validationStatus: validationResult.status,
-      email: validationResult.currentEmail,
-      clientId: clientId || 'default'
-    });
-    
-    if (!this.config.hubspot?.apiKey) {
-      console.error('HUBSPOT_UPDATE: API key not configured');
-      return {
-        success: false,
-        contactId,
-        error: 'HubSpot API key not configured'
-      };
-    }
-
-    try {
-      console.log('HUBSPOT_UPDATE: Preparing properties for update');
-      
-      return await this.withTimeout(
-        async (signal) => {
-          // Prepare properties to update
-          const properties = {
-            email: validationResult.currentEmail,
-            email_status: validationResult.status,
-            email_recheck_needed: validationResult.recheckNeeded,
-            email_check_date: new Date().toISOString(),
-            
-            // Include Unmessy specific fields
-            um_email_status: validationResult.um_email_status,
-            um_bounce_status: validationResult.um_bounce_status,
-            date_last_um_check: validationResult.date_last_um_check,
-            um_check_id: validationResult.um_check_id,
-            
-            // Add client ID that performed the validation
-            validation_client_id: clientId || this.clientId
-          };
-          
-          // Add original email if corrected (either by built-in corrections or ZeroBounce suggestion)
-          if (validationResult.wasCorrected) {
-            properties.original_email = validationResult.originalEmail;
-            properties.email_corrected = true;
-            
-            // If correction was due to ZeroBounce suggestion, add that info
-            if (validationResult.validationSteps?.some(step => step.step === 'zerobounce_suggestion')) {
-              properties.email_correction_source = 'zerobounce';
-              
-              const suggestionStep = validationResult.validationSteps?.find(
-                step => step.step === 'zerobounce_suggestion'
-              );
-              
-              if (suggestionStep) {
-                properties.email_suggested_by_zerobounce = true;
-                properties.email_suggestion_original = suggestionStep.original;
-              }
-            } else {
-              properties.email_correction_source = 'internal';
-            }
-          }
-          
-          if (validationResult.subStatus) {
-            properties.email_sub_status = validationResult.subStatus;
-          }
-          
-          console.log('HUBSPOT_UPDATE: Sending update request', {
-            contactId,
-            properties: Object.keys(properties).join(', '),
-            clientId: clientId || 'default'
-          });
-          
-          // Send update request
-          const response = await fetch(
-            `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}`,
-            {
-              method: 'PATCH',
-              headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${this.config.hubspot.apiKey}`
-              },
-              body: JSON.stringify({ properties }),
-              signal
-            }
-          );
-          
-          console.log('HUBSPOT_UPDATE: Received response', {
-            contactId,
-            status: response.status,
-            statusText: response.statusText
-          });
-          
-          if (!response.ok) {
-            throw new Error(`HubSpot API error: ${response.status} ${response.statusText}`);
-          }
-          
-          const data = await response.json();
-          
-          console.log('HUBSPOT_UPDATE: Successfully updated contact', {
-            contactId,
-            responseId: data.id,
-            clientId: clientId || 'default'
-          });
-          
-          return {
-            success: true,
-            contactId,
-            hubspotResponse: data
-          };
-        },
-        this.timeouts.hubspot,
-        'HubSpot update timeout'
-      );
-    } catch (error) {
-      console.error('HUBSPOT_UPDATE_ERROR:', { 
-        message: error.message, 
-        contactId,
-        clientId: clientId || 'default'
-      });
-      return {
-        success: false,
-        contactId,
-        error: error.message
-      };
-    }
   }
 }
