@@ -1,4 +1,6 @@
+// api/email.js
 import { EmailValidationService } from '../../src/services/email-validator.js';
+import { ClientManagerService } from '../../src/services/client-manager.js';
 import dotenv from 'dotenv';
 
 // Load environment variables
@@ -6,7 +8,7 @@ dotenv.config();
 
 // Detailed logging for configuration and connection status
 console.log('=============================================');
-console.log('EMAIL VALIDATION API STARTUP - FIXED VERSION');
+console.log('EMAIL VALIDATION API STARTUP - SECURED VERSION');
 console.log('=============================================');
 
 // Log environment variables (safely)
@@ -89,6 +91,12 @@ console.log('API CONFIGURATION:', {
   umessyVersion: config.umessyVersion
 });
 
+// Initialize the client manager service
+const clientManager = new ClientManagerService();
+
+// Log loaded clients
+console.log(`CLIENT MANAGER: Loaded ${clientManager.clients.size} client API keys`);
+
 // Initialize the email validation service
 const emailValidator = new EmailValidationService(config);
 
@@ -139,14 +147,56 @@ export default async function handler(req, res) {
   }
   
   try {
+    // Get API key from request
+    const apiKey = req.headers['x-api-key'] || req.query.api_key;
+    
+    // Validate API key
+    const keyValidation = clientManager.validateApiKey(apiKey);
+    
+    if (!keyValidation.valid) {
+      console.log('API REQUEST: Invalid API key', { 
+        apiKey: apiKey ? `${apiKey.substring(0, 8)}...` : 'missing',
+        reason: keyValidation.reason
+      });
+      
+      return res.status(401).json({ 
+        error: 'Unauthorized', 
+        reason: keyValidation.reason === 'missing_api_key' ? 'API key is required' : 'Invalid API key'
+      });
+    }
+    
+    // Get client details from validation result
+    const client = keyValidation.client;
+    
+    // Check rate limit
+    const limitCheck = clientManager.checkEmailRateLimit(client.clientId);
+    
+    if (limitCheck.limited) {
+      console.log('API REQUEST: Rate limit exceeded', {
+        clientId: client.clientId,
+        clientName: client.name,
+        emailCount: limitCheck.emailCount,
+        emailLimit: limitCheck.emailLimit
+      });
+      
+      return res.status(429).json({
+        error: 'Rate limit exceeded',
+        limit: limitCheck.emailLimit,
+        used: limitCheck.emailCount,
+        remaining: limitCheck.remaining
+      });
+    }
+    
     const { email } = req.body;
     
     if (!email) {
       return res.status(400).json({ error: 'Email is required' });
     }
     
-    // Log request info
+    // Log request info with client details
     console.log('API REQUEST: Processing email validation', { 
+      clientId: client.clientId,
+      clientName: client.name,
       email,
       timestamp: new Date().toISOString(),
       supabaseStatus: emailValidator.supabaseConnectionStatus || 'unknown'
@@ -158,7 +208,7 @@ export default async function handler(req, res) {
       
       // Generate unmessy fields for invalid format
       const now = new Date();
-      const umCheckId = emailValidator.generateUmCheckId();
+      const umCheckId = emailValidator.generateUmCheckId(client.clientId);
       
       const result = {
         originalEmail: email,
@@ -179,10 +229,14 @@ export default async function handler(req, res) {
       
       // Log the result before returning
       console.log('API RESPONSE: Returning invalid format result', {
+        clientId: client.clientId,
         email,
         status: result.status,
         subStatus: result.subStatus
       });
+      
+      // Increment the client's email count even for invalid emails
+      clientManager.incrementEmailCount(client.clientId);
       
       return res.status(200).json(result);
     }
@@ -197,6 +251,7 @@ export default async function handler(req, res) {
     try {
       // Log that we're starting validation
       console.log('VALIDATION: Starting validation process', {
+        clientId: client.clientId,
         email,
         supabaseStatus: emailValidator.supabaseConnectionStatus || 'unknown',
         zeroBounceEnabled: config.useZeroBounce
@@ -207,13 +262,18 @@ export default async function handler(req, res) {
       const result = await Promise.race([
         emailValidator.validateEmail(email, { 
           skipZeroBounce: !config.useZeroBounce, 
-          timeoutMs: config.timeouts.validation
+          timeoutMs: config.timeouts.validation,
+          clientId: client.clientId // Pass client ID to the validation service
         }),
         timeoutPromise
       ]);
       
+      // Increment the client's email count for successful validation
+      clientManager.incrementEmailCount(client.clientId);
+      
       // Log success and return result
       console.log('API RESPONSE: Validation completed successfully', {
+        clientId: client.clientId,
         email,
         status: result.status,
         wasCorrected: result.wasCorrected,
@@ -225,15 +285,20 @@ export default async function handler(req, res) {
     } catch (error) {
       // Log the error and fall back to quick validation
       console.error('VALIDATION ERROR: Validation timed out or failed', {
+        clientId: client.clientId,
         email,
         error: error.message,
         stack: error.stack?.split('\n')[0]
       });
       
       // Get quick validation result as a fallback
-      const quickResult = emailValidator.quickValidate(email);
+      const quickResult = await emailValidator.quickValidate(email, client.clientId);
+      
+      // Increment the client's email count even for fallback results
+      clientManager.incrementEmailCount(client.clientId);
       
       console.log('API RESPONSE: Falling back to quick validation result', {
+        clientId: client.clientId,
         email,
         fallbackStatus: quickResult.status
       });
@@ -254,7 +319,7 @@ export default async function handler(req, res) {
   }
 }
 
-// Health check endpoint implementation
+// Health check endpoint implementation with added client stats
 async function healthCheck(req, res) {
   if (req.method !== 'GET') {
     return res.status(405).json({ error: 'Method not allowed' });
@@ -294,6 +359,18 @@ async function healthCheck(req, res) {
       }
     }
     
+    // Get client statistics - redacted for health check
+    const clientStats = clientManager.listClientsStats().map(client => ({
+      clientId: client.clientId,
+      name: client.name,
+      dailyEmailLimit: client.dailyEmailLimit,
+      usage: {
+        date: client.usage.date,
+        emailCount: client.usage.emailCount,
+        remaining: client.usage.remaining
+      }
+    }));
+    
     // Return health status
     return res.status(200).json({
       status: 'ok',
@@ -310,6 +387,10 @@ async function healthCheck(req, res) {
         url: emailValidator.config.supabase.url ? `${emailValidator.config.supabase.url.substring(0, 15)}...` : 'not set',
         keyPresent: !!emailValidator.config.supabase.key,
         directCheck: directCheckResult
+      },
+      clients: {
+        count: clientManager.clients.size,
+        stats: clientStats
       }
     });
   } catch (error) {
