@@ -258,7 +258,7 @@ export class EmailValidationService {
     }
   }
   
-  // Save validation result to Supabase with improved reliability and check existing
+  // Save validation result to Supabase with improved reliability
   async saveValidationResult(originalEmail, validationResult, clientId = null) {
     if (!this.supabaseEnabled || !this.supabase) {
       console.log('SUPABASE_SAVE: Supabase not enabled, skipping save', {
@@ -353,15 +353,14 @@ export class EmailValidationService {
           contactId: existingRecord.contact_id
         });
         
-        // Prepare update data
+        // Prepare update data - REMOVED client_id field
         const updateData = {
           date_last_um_check: validationResult.date_last_um_check || now.toISOString(),
           date_last_um_check_epoch: validationResult.date_last_um_check_epoch || Math.floor(now.getTime() / 1000),
           um_check_id: umCheckId,
           um_email: validationResult.currentEmail || validationResult.um_email || originalEmail,
           um_email_status: umEmailStatus,
-          um_bounce_status: umBounceStatus,
-          client_id: clientId || null // Store the client ID that requested this validation
+          um_bounce_status: umBounceStatus
         };
         
         // Update the existing record
@@ -420,7 +419,7 @@ export class EmailValidationService {
         throw contactError;
       }
       
-      // Now insert the email validation record
+      // Now insert the email validation record - REMOVED client_id field
       const validationData = {
         contact_id: contactId,
         date_last_um_check: validationResult.date_last_um_check || now.toISOString(),
@@ -429,8 +428,7 @@ export class EmailValidationService {
         um_email: validationResult.currentEmail || validationResult.um_email || originalEmail,
         email: originalEmail,
         um_email_status: umEmailStatus,
-        um_bounce_status: umBounceStatus,
-        client_id: clientId || null // Store the client ID that requested this validation
+        um_bounce_status: umBounceStatus
       };
       
       try {
