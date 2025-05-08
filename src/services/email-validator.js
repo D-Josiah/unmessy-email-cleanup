@@ -258,7 +258,7 @@ export class EmailValidationService {
     }
   }
   
-  // Save validation result to Supabase with improved reliability
+  // Save validation result to Supabase with improved reliability and check existing
   async saveValidationResult(originalEmail, validationResult, clientId = null) {
     if (!this.supabaseEnabled || !this.supabase) {
       console.log('SUPABASE_SAVE: Supabase not enabled, skipping save', {
@@ -327,6 +327,71 @@ export class EmailValidationService {
           umBounceStatus = 'Likely to bounce';
         }
       }
+      
+      // First, check if the email already exists in the database
+      console.log('SUPABASE_SAVE: Checking if email already exists in database', { email: originalEmail });
+      
+      const { data: existingRecord, error: searchError } = await this.supabase
+        .from('email_validations')
+        .select('id, contact_id')
+        .eq('email', originalEmail)
+        .maybeSingle();
+        
+      if (searchError && searchError.code !== 'PGRST116') { // PGRST116 is "No rows returned" error
+        console.error('SUPABASE_SAVE_ERROR: Error searching for existing record', {
+          error: searchError.message,
+          code: searchError.code
+        });
+        throw new Error(`Failed to search for existing record: ${searchError.message}`);
+      }
+      
+      // If email exists, update the existing record
+      if (existingRecord) {
+        console.log('SUPABASE_SAVE: Email found in database, updating existing record', {
+          email: originalEmail,
+          recordId: existingRecord.id,
+          contactId: existingRecord.contact_id
+        });
+        
+        // Prepare update data
+        const updateData = {
+          date_last_um_check: validationResult.date_last_um_check || now.toISOString(),
+          date_last_um_check_epoch: validationResult.date_last_um_check_epoch || Math.floor(now.getTime() / 1000),
+          um_check_id: umCheckId,
+          um_email: validationResult.currentEmail || validationResult.um_email || originalEmail,
+          um_email_status: umEmailStatus,
+          um_bounce_status: umBounceStatus,
+          client_id: clientId || null // Store the client ID that requested this validation
+        };
+        
+        // Update the existing record
+        const { data: updatedRecord, error: updateError } = await this.supabase
+          .from('email_validations')
+          .update(updateData)
+          .eq('id', existingRecord.id)
+          .select()
+          .single();
+          
+        if (updateError) {
+          console.error('SUPABASE_SAVE_ERROR: Failed to update existing record', {
+            error: updateError.message,
+            code: updateError.code
+          });
+          throw new Error(`Failed to update existing record: ${updateError.message}`);
+        }
+        
+        console.log('SUPABASE_SAVE: Successfully updated existing record', {
+          email: originalEmail,
+          operation: 'update',
+          id: updatedRecord.id,
+          clientId: clientId || 'default'
+        });
+        
+        return { success: true, operation: 'update', data: updatedRecord };
+      }
+      
+      // If email doesn't exist, create a new contact and validation record
+      console.log('SUPABASE_SAVE: Email not found in database, creating new record');
       
       // First, create a contact - use a simpler approach to avoid transaction issues
       console.log('SUPABASE_SAVE: Creating new contact');
