@@ -55,10 +55,15 @@ export default async function handler(req, res) {
       redisStatus.error = redisError.message;
     }
     
-    // Check ZeroBounce config
+    // Check ZeroBounce config including retry settings
     const zeroBounceStatus = {
       configured: !!process.env.ZERO_BOUNCE_API_KEY,
-      enabled: process.env.USE_ZERO_BOUNCE === 'true'
+      enabled: process.env.USE_ZERO_BOUNCE === 'true',
+      maxRetries: parseInt(process.env.ZERO_BOUNCE_MAX_RETRIES || '1', 10),
+      timeouts: {
+        initial: parseInt(process.env.ZERO_BOUNCE_TIMEOUT || '6000', 10),
+        retry: parseInt(process.env.ZERO_BOUNCE_RETRY_TIMEOUT || '8000', 10)
+      }
     };
     
     // Return health information
@@ -69,7 +74,22 @@ export default async function handler(req, res) {
       redis: redisStatus,
       zeroBounce: zeroBounceStatus,
       redisEnabled: process.env.USE_REDIS === 'true',
-      version: process.env.npm_package_version || '1.0.0'
+      version: process.env.npm_package_version || '1.0.0',
+      dateFormats: {
+        example: {
+          spelled: new Date().toLocaleString('en-US', { 
+            weekday: 'long',
+            year: 'numeric', 
+            month: 'long', 
+            day: 'numeric',
+            hour: 'numeric',
+            minute: 'numeric',
+            second: 'numeric',
+            timeZoneName: 'short'
+          }),
+          epochMs: Date.now() // Milliseconds format example
+        }
+      }
     });
   } catch (error) {
     console.error('Health check failed:', error);

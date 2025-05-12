@@ -83,11 +83,12 @@ export class EmailValidationService {
       }
     }
     
-    // Timeouts configuration with defaults
+    // Timeouts configuration with defaults - UPDATED with longer ZeroBounce timeout
     this.timeouts = {
       supabase: config.timeouts?.supabase || 8000,
-      zeroBounce: config.timeouts?.zeroBounce || 4000,
-      validation: config.timeouts?.validation || 4000, 
+      zeroBounce: config.timeouts?.zeroBounce || 6000, // Increased from 4000 to 6000ms
+      zeroBounceRetry: config.timeouts?.zeroBounceRetry || 8000, // New timeout for retry
+      validation: config.timeouts?.validation || 7000, // Increased to accommodate retry
       webhook: config.timeouts?.webhook || 6000
     };
 
@@ -97,6 +98,9 @@ export class EmailValidationService {
     // Client ID for um_check_id generation
     this.clientId = config.clientId || '00001';
     this.umessyVersion = config.umessyVersion || '100';
+    
+    // Configure ZeroBounce retry settings
+    this.zeroBounceMaxRetries = config.zeroBounceMaxRetries || 1; // Default to 1 retry
   }
 
   // Asynchronous test without blocking operations
@@ -165,15 +169,32 @@ export class EmailValidationService {
     }
   }
   
-  // Generate um_check_id based on specification
+  // UPDATED: Format date as spelled out date instead of ISO format
+  formatDateString(date) {
+    const options = { 
+      weekday: 'long',
+      year: 'numeric', 
+      month: 'long', 
+      day: 'numeric',
+      hour: 'numeric',
+      minute: 'numeric',
+      second: 'numeric',
+      timeZoneName: 'short'
+    };
+    
+    return date.toLocaleDateString('en-US', options);
+  }
+  
+  // UPDATED: Generate um_check_id based on specification using milliseconds for uniqueness
   generateUmCheckId(customClientId = null) {
-    const epochTime = Math.floor(Date.now() / 1000);
+    // Use milliseconds instead of seconds for greater uniqueness
+    const epochTime = Date.now(); // This gives milliseconds
     const lastSixDigits = String(epochTime).slice(-6);
     
     // Use provided client ID or default
     const clientId = customClientId || this.clientId;
     
-    // Calculate check digit
+    // Calculate check digit using the first few digits of the timestamp
     const firstThreeDigits = String(epochTime).slice(0, 3);
     const sum = [...firstThreeDigits].reduce((acc, digit) => acc + parseInt(digit), 0);
     const checkDigit = String(sum * parseInt(clientId)).padStart(3, '0');
@@ -462,7 +483,7 @@ export class EmailValidationService {
           
           const { data, error } = await this.supabase
             .from('email_validations')
-            .select('email, um_email_status')
+            .select('email, um_email_status, um_bounce_status, date_last_um_check, date_last_um_check_epoch, um_check_id')
             .eq('email', email)
             .abortSignal(signal)
             .single();
@@ -560,6 +581,10 @@ export class EmailValidationService {
       const umCheckId = validationResult.um_check_id || this.generateUmCheckId(clientId);
       const now = new Date();
       
+      // UPDATED: Format date as spelled out date and use milliseconds for epoch
+      const formattedDate = this.formatDateString(now);
+      const epochTimeMs = now.getTime(); // Use full milliseconds for uniqueness
+      
       // Map validation status to um_email_status and um_bounce_status
       let umEmailStatus = validationResult.um_email_status || 'Unable to change';
       let umBounceStatus = validationResult.um_bounce_status || 'Unknown';
@@ -605,10 +630,10 @@ export class EmailValidationService {
           contactId: existingRecord.contact_id
         });
         
-        // Prepare update data
+        // Prepare update data with new date format and millisecond epoch
         const updateData = {
-          date_last_um_check: validationResult.date_last_um_check || now.toISOString(),
-          date_last_um_check_epoch: validationResult.date_last_um_check_epoch || Math.floor(now.getTime() / 1000),
+          date_last_um_check: validationResult.date_last_um_check || formattedDate,
+          date_last_um_check_epoch: validationResult.date_last_um_check_epoch || epochTimeMs,
           um_check_id: umCheckId,
           um_email: validationResult.currentEmail || validationResult.um_email || email,
           um_email_status: umEmailStatus,
@@ -671,11 +696,11 @@ export class EmailValidationService {
         throw contactError;
       }
       
-      // Now insert the email validation record
+      // Now insert the email validation record with updated date format and millisecond epoch
       const validationData = {
         contact_id: contactId,
-        date_last_um_check: validationResult.date_last_um_check || now.toISOString(),
-        date_last_um_check_epoch: validationResult.date_last_um_check_epoch || Math.floor(now.getTime() / 1000),
+        date_last_um_check: validationResult.date_last_um_check || formattedDate,
+        date_last_um_check_epoch: validationResult.date_last_um_check_epoch || epochTimeMs,
         um_check_id: umCheckId,
         um_email: validationResult.currentEmail || validationResult.um_email || email,
         email: email,
@@ -811,11 +836,16 @@ export class EmailValidationService {
     }
   }
   
-  // Quick validation with database checks for domain validity
+  // UPDATED: Quick validation with database checks for domain validity and new date formats
   async quickValidate(email, clientId = null) {
     // Step 1: Format check (synchronous)
     const formatValid = this.isValidEmailFormat(email);
     if (!formatValid) {
+      // UPDATED: Use new date format and millisecond epoch
+      const now = new Date();
+      const formattedDate = this.formatDateString(now);
+      const epochTimeMs = now.getTime();
+      
       return {
         originalEmail: email,
         currentEmail: email,
@@ -824,7 +854,15 @@ export class EmailValidationService {
         status: 'invalid',
         subStatus: 'bad_format',
         recheckNeeded: false,
-        validationSteps: [{ step: 'format_check', passed: false }]
+        validationSteps: [{ step: 'format_check', passed: false }],
+        // Add unmessy specific fields with updated formats
+        date_last_um_check: formattedDate,
+        date_last_um_check_epoch: epochTimeMs,
+        um_check_id: this.generateUmCheckId(clientId),
+        um_email: email,
+        email: email,
+        um_email_status: 'Unable to change',
+        um_bounce_status: 'Likely to bounce'
       };
     }
     
@@ -841,9 +879,11 @@ export class EmailValidationService {
     if (isInvalidDomain) {
       console.log('QUICK_VALIDATE: Domain is invalid (in invalid_domains table)', { domain });
       
-      // Generate um_check_id and timestamps
+      // UPDATED: Generate um_check_id and timestamps with new formats
       const umCheckId = this.generateUmCheckId(clientId);
       const now = new Date();
+      const formattedDate = this.formatDateString(now);
+      const epochTimeMs = now.getTime();
       
       return {
         originalEmail: email,
@@ -860,9 +900,9 @@ export class EmailValidationService {
           { step: 'typo_correction', applied: corrected, original: email, corrected: correctedEmail },
           { step: 'invalid_domain_check', passed: false, domain: domain }
         ],
-        // Add unmessy specific fields
-        date_last_um_check: now.toISOString(),
-        date_last_um_check_epoch: Math.floor(now.getTime() / 1000),
+        // Updated unmessy specific fields
+        date_last_um_check: formattedDate,
+        date_last_um_check_epoch: epochTimeMs,
         um_check_id: umCheckId,
         um_email: correctedEmail,
         email: email,
@@ -875,9 +915,11 @@ export class EmailValidationService {
     const domainValid = await this.isValidDomain(correctedEmail);
     const status = domainValid ? 'valid' : 'unknown';
     
-    // Generate um_check_id
+    // UPDATED: Generate um_check_id and timestamps with new formats
     const umCheckId = this.generateUmCheckId(clientId);
     const now = new Date();
+    const formattedDate = this.formatDateString(now);
+    const epochTimeMs = now.getTime();
     
     // Determine Unmessy statuses
     const umEmailStatus = corrected ? 'Changed' : 'Unchanged';
@@ -896,9 +938,9 @@ export class EmailValidationService {
         { step: 'typo_correction', applied: corrected, original: email, corrected: correctedEmail },
         { step: 'domain_check', passed: domainValid }
       ],
-      // Add unmessy specific fields
-      date_last_um_check: now.toISOString(),
-      date_last_um_check_epoch: Math.floor(now.getTime() / 1000),
+      // Updated unmessy specific fields
+      date_last_um_check: formattedDate,
+      date_last_um_check_epoch: epochTimeMs,
       um_check_id: umCheckId,
       um_email: correctedEmail,
       email: email,
@@ -907,8 +949,8 @@ export class EmailValidationService {
     };
   }
   
-  // ZeroBounce check with proper timeout handling and did_you_mean handling
-  async checkWithZeroBounce(email, clientId = null) {
+  // UPDATED: ZeroBounce check with retry logic, longer timeouts, and updated date formats
+  async checkWithZeroBounce(email, clientId = null, retryCount = 0) {
     if (!this.config.zeroBounceApiKey || this.config.useZeroBounce === false) {
       console.log('ZEROBOUNCE_CHECK: ZeroBounce not configured or disabled, skipping check');
       return {
@@ -922,8 +964,14 @@ export class EmailValidationService {
     try {
       console.log('ZEROBOUNCE_CHECK: Starting validation for email', { 
         email,
-        clientId: clientId || 'default'
+        clientId: clientId || 'default',
+        retryAttempt: retryCount
       });
+      
+      // Determine which timeout to use based on retry count
+      const timeoutMs = retryCount > 0 
+        ? this.timeouts.zeroBounceRetry  // Use longer timeout for retry
+        : this.timeouts.zeroBounce;      // Use standard timeout for first attempt
       
       const result = await this.withTimeout(
         async (signal) => {
@@ -934,6 +982,7 @@ export class EmailValidationService {
           
           console.log('ZEROBOUNCE_CHECK: Sending request to ZeroBounce API', { 
             email,
+            retryAttempt: retryCount,
             url: url.toString().replace(this.config.zeroBounceApiKey, '[REDACTED]')
           });
           
@@ -949,12 +998,15 @@ export class EmailValidationService {
             email,
             status: result.status,
             subStatus: result.sub_status,
-            didYouMean: result.did_you_mean || null
+            didYouMean: result.did_you_mean || null,
+            retryAttempt: retryCount
           });
           
-          // Generate unmessy fields
+          // UPDATED: Generate unmessy fields with new date format and millisecond epoch
           const umCheckId = this.generateUmCheckId(clientId);
           const now = new Date();
+          const formattedDate = this.formatDateString(now);
+          const epochTimeMs = now.getTime();
           
           // Check for "did_you_mean" suggestions
           let suggestedEmail = null;
@@ -1011,7 +1063,8 @@ export class EmailValidationService {
             subStatus,
             recheckNeeded,
             suggestedEmail,
-            clientId: clientId || 'default'
+            clientId: clientId || 'default',
+            retryAttempt: retryCount
           });
           
           return {
@@ -1022,9 +1075,10 @@ export class EmailValidationService {
             suggestedEmail,
             source: 'zerobounce',
             details: result,
-            // Add unmessy specific fields
-            date_last_um_check: now.toISOString(),
-            date_last_um_check_epoch: Math.floor(now.getTime() / 1000),
+            retryCount,
+            // Add unmessy specific fields with updated formats
+            date_last_um_check: formattedDate,
+            date_last_um_check_epoch: epochTimeMs,
             um_check_id: umCheckId,
             um_email: suggestedEmail || email,
             email: email,
@@ -1032,7 +1086,7 @@ export class EmailValidationService {
             um_bounce_status: umBounceStatus
           };
         },
-        this.timeouts.zeroBounce,
+        timeoutMs,
         'ZeroBounce check timeout'
       );
       
@@ -1041,26 +1095,50 @@ export class EmailValidationService {
       console.error('ZEROBOUNCE_CHECK_ERROR:', { 
         message: error.message, 
         email,
-        clientId: clientId || 'default'
+        clientId: clientId || 'default',
+        retryAttempt: retryCount
       });
+      
+      // UPDATED: Implement retry logic on timeout or failure
+      const isTimeout = error.message.includes('timeout');
+      const shouldRetry = retryCount < this.zeroBounceMaxRetries; 
+      
+      if ((isTimeout || error.message.includes('network')) && shouldRetry) {
+        console.log('ZEROBOUNCE_CHECK: Retrying after error', {
+          email,
+          retryCount,
+          error: error.message
+        });
+        
+        // Wait briefly before retry (exponential backoff)
+        const backoffDelay = Math.min(1000 * Math.pow(2, retryCount), 3000);
+        await new Promise(resolve => setTimeout(resolve, backoffDelay));
+        
+        // Retry the check with incremented retry count
+        return this.checkWithZeroBounce(email, clientId, retryCount + 1);
+      }
+      
+      // Return failure response if we can't retry
       return {
         email,
         status: 'check_failed',
         recheckNeeded: true,
         source: 'zerobounce',
-        error: error.message
+        error: error.message,
+        retryCount,
+        isTimeout
       };
     }
   }
   
-  // Save data synchronously during the validation process
-  // Modified to use database checks for domain validation
+  // UPDATED: Save data synchronously during validation with retry logic and new date formats
   async validateEmail(email, options = {}) {
     const { 
       skipZeroBounce = false, 
       timeoutMs = this.timeouts.validation, 
       isRetry = false,
-      clientId = null  // Parameter to track which client made the request
+      clientId = null,  // Parameter to track which client made the request
+      retryCount = 0    // Track ZeroBounce retry attempts
     } = options;
     
     console.log('VALIDATION_PROCESS: Starting validation for email', { 
@@ -1068,6 +1146,7 @@ export class EmailValidationService {
       skipZeroBounce, 
       timeoutMs,
       isRetry,
+      retryCount,
       clientId: clientId || 'default',
       supabaseStatus: this.supabaseConnectionStatus
     });
@@ -1102,13 +1181,13 @@ export class EmailValidationService {
           // Run Supabase check and ZeroBounce check in parallel
           const [knownValidResult, zeroBounceResult] = await Promise.allSettled([
             this.isKnownValidEmail(quickResult.currentEmail),
-            skipZeroBounce ? null : this.checkWithZeroBounce(quickResult.currentEmail, clientId)
+            skipZeroBounce ? null : this.checkWithZeroBounce(quickResult.currentEmail, clientId, retryCount)
           ]);
           
           // Start with the quick result and enhance it
           const result = { ...quickResult };
           
-          // Add Supabase result if successful
+          // Add Supabase result if successful - this is the database fallback
           if (knownValidResult.status === 'fulfilled' && knownValidResult.value.found) {
             console.log('VALIDATION_PROCESS: Email found in Supabase database, marking as valid', { 
               email: quickResult.currentEmail 
@@ -1135,7 +1214,13 @@ export class EmailValidationService {
             result.validationSteps.push({ step: 'known_valid_check', passed: true });
             
             // If we already have a recent validation, we can return early
-            if (validationData && Date.now() - (validationData.date_last_um_check_epoch * 1000) < 7 * 24 * 60 * 60 * 1000) {
+            // UPDATED: Check if date_last_um_check_epoch is in milliseconds or seconds format
+            const lastCheckMs = typeof validationData.date_last_um_check_epoch === 'number' && 
+                               validationData.date_last_um_check_epoch > 1000000000000
+              ? validationData.date_last_um_check_epoch  // Already in milliseconds
+              : (validationData.date_last_um_check_epoch || 0) * 1000;  // Convert seconds to milliseconds
+
+            if (validationData && Date.now() - lastCheckMs < 7 * 24 * 60 * 60 * 1000) {
               return result;
             }
           } else {
@@ -1152,7 +1237,7 @@ export class EmailValidationService {
             });
           }
           
-          // Check ZeroBounce result and process any suggested email
+          // UPDATED: Check ZeroBounce result and handle retry failures
           if (!skipZeroBounce && zeroBounceResult?.status === 'fulfilled' && zeroBounceResult.value) {
             const bounceCheck = zeroBounceResult.value;
             
@@ -1161,6 +1246,7 @@ export class EmailValidationService {
               status: bounceCheck.status,
               subStatus: bounceCheck.subStatus,
               suggestedEmail: bounceCheck.suggestedEmail,
+              retryCount: bounceCheck.retryCount || 0,
               clientId: clientId || 'default'
             });
             
@@ -1248,14 +1334,40 @@ export class EmailValidationService {
               result: bounceCheck
             });
           } else if (!skipZeroBounce) {
+            // UPDATED: Handle ZeroBounce failure (including after retries)
             console.log('VALIDATION_PROCESS: ZeroBounce check failed or was skipped', {
               email: quickResult.currentEmail,
-              error: zeroBounceResult?.reason?.message || 'Failed or skipped'
+              error: zeroBounceResult?.reason?.message || 'Failed or skipped',
+              retryCount: retryCount
             });
+            
+            // If this was a timeout and we still have domain check results, use those instead
+            if (zeroBounceResult?.reason?.message?.includes('timeout') || 
+                (zeroBounceResult?.value?.error?.includes('timeout'))) {
+              
+              console.log('VALIDATION_PROCESS: ZeroBounce timed out, using database check results', {
+                email: quickResult.currentEmail,
+                domainValid: result.domainValid
+              });
+              
+              // If domain is valid according to database checks, we can consider the email valid
+              if (result.domainValid) {
+                console.log('VALIDATION_PROCESS: Domain valid in database, marking as valid despite ZeroBounce timeout');
+                result.status = 'valid';
+                result.recheckNeeded = false;
+                result.um_bounce_status = 'Unlikely to bounce';
+                
+                // Ensure we have updated date formats
+                const now = new Date();
+                result.date_last_um_check = this.formatDateString(now);
+                result.date_last_um_check_epoch = now.getTime();
+              }
+            }
             
             result.validationSteps.push({
               step: 'zerobounce_check',
-              error: zeroBounceResult?.reason?.message || 'Failed or skipped'
+              error: zeroBounceResult?.reason?.message || 'Failed or skipped',
+              fallbackToDatabase: result.domainValid
             });
           }
           

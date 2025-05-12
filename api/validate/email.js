@@ -33,10 +33,12 @@ console.log('RUNTIME ENVIRONMENT:', {
 });
 
 // Load configuration with explicit values and defaults
+// UPDATED: Added ZeroBounce retry settings and increased timeouts
 const config = {
   // ZeroBounce settings
   useZeroBounce: process.env.USE_ZERO_BOUNCE === 'true',
   zeroBounceApiKey: process.env.ZERO_BOUNCE_API_KEY || '',
+  zeroBounceMaxRetries: parseInt(process.env.ZERO_BOUNCE_MAX_RETRIES || '1', 10),
   
   // Email processing settings
   removeGmailAliases: true,
@@ -72,17 +74,19 @@ const config = {
   clientId: process.env.CLIENT_ID || '00001',
   umessyVersion: process.env.UMESSY_VERSION || '100',
   
-  // Timeouts - increased but staying within Vercel limits
+  // UPDATED: Timeouts - increased with additional ZeroBounce retry timeout
   timeouts: {
-    supabase: 8000,       // 8 seconds for Supabase operations 
-    zeroBounce: 4000,     // 4 seconds for ZeroBounce operations
-    validation: 7000,     // 7 seconds for overall validation
+    supabase: 8000,             // 8 seconds for Supabase operations 
+    zeroBounce: 6000,           // 6 seconds for ZeroBounce operations (up from 4000)
+    zeroBounceRetry: 8000,      // 8 seconds for ZeroBounce retry operations (new)
+    validation: 10000,          // 10 seconds for overall validation (up from 7000)
   }
 };
 
 // Log the configuration (safely)
 console.log('API CONFIGURATION:', {
   useZeroBounce: config.useZeroBounce,
+  zeroBounceMaxRetries: config.zeroBounceMaxRetries,
   useSupabase: config.useSupabase,
   supabaseUrlSet: !!config.supabase.url,
   supabaseKeyLength: config.supabase.key ? config.supabase.key.length : 0,
@@ -206,8 +210,10 @@ export default async function handler(req, res) {
     if (!emailValidator.isValidEmailFormat(email)) {
       console.log('VALIDATION: Invalid email format detected');
       
-      // Generate unmessy fields for invalid format
+      // UPDATED: Generate unmessy fields for invalid format with new date format and millisecond epoch
       const now = new Date();
+      const formattedDate = emailValidator.formatDateString(now);
+      const epochTimeMs = now.getTime(); // Use milliseconds for uniqueness
       const umCheckId = emailValidator.generateUmCheckId(client.clientId);
       
       const result = {
@@ -217,9 +223,9 @@ export default async function handler(req, res) {
         status: 'invalid',
         subStatus: 'bad_format',
         recheckNeeded: false,
-        // Add unmessy specific fields
-        date_last_um_check: now.toISOString(),
-        date_last_um_check_epoch: Math.floor(now.getTime() / 1000),
+        // Add unmessy specific fields with updated formats
+        date_last_um_check: formattedDate,
+        date_last_um_check_epoch: epochTimeMs,
         um_check_id: umCheckId,
         um_email: email,
         email: email,
@@ -256,11 +262,12 @@ export default async function handler(req, res) {
       return res.status(200).json(responseWithClientInfo);
     }
     
-    // Set a strict global timeout to ensure we respond before Vercel's timeout
+    // UPDATED: Set a strict global timeout to ensure we respond before Vercel's timeout
+    // Increased from 9000 to 9500 to accommodate retries
     const timeoutPromise = new Promise((_, reject) => {
       setTimeout(() => {
         reject(new Error('Function timeout to prevent Vercel runtime timeout'));
-      }, 9000); // 9 seconds (just under Vercel's 10-second limit)
+      }, 9500); // 9.5 seconds (just under Vercel's 10-second limit)
     });
     
     try {
@@ -326,7 +333,7 @@ export default async function handler(req, res) {
         stack: error.stack?.split('\n')[0]
       });
       
-      // Get quick validation result as a fallback
+      // UPDATED: Get quick validation result as a fallback with new date format
       const quickResult = await emailValidator.quickValidate(email, client.clientId);
       
       // Increment the client's email count even for fallback results
@@ -426,7 +433,7 @@ async function healthCheck(req, res) {
       }
     }));
     
-    // Return health status
+    // Return health status with ZeroBounce retry settings
     return res.status(200).json({
       status: 'ok',
       timestamp: new Date().toISOString(),
@@ -442,6 +449,14 @@ async function healthCheck(req, res) {
         url: emailValidator.config.supabase.url ? `${emailValidator.config.supabase.url.substring(0, 15)}...` : 'not set',
         keyPresent: !!emailValidator.config.supabase.key,
         directCheck: directCheckResult
+      },
+      zeroBounce: {
+        enabled: config.useZeroBounce,
+        maxRetries: config.zeroBounceMaxRetries,
+        timeouts: {
+          initial: config.timeouts.zeroBounce,
+          retry: config.timeouts.zeroBounceRetry
+        }
       },
       clients: {
         count: clientManager.clients.size,

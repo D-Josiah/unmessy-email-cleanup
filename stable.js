@@ -87,35 +87,12 @@ export class EmailValidationService {
     this.timeouts = {
       supabase: config.timeouts?.supabase || 8000,
       zeroBounce: config.timeouts?.zeroBounce || 4000,
-      hubspot: config.timeouts?.hubspot || 5000,
       validation: config.timeouts?.validation || 4000, 
       webhook: config.timeouts?.webhook || 6000
     };
 
-    // Common email domain typos
-    this.domainTypos = {
-      'gmial.com': 'gmail.com',
-      'gmal.com': 'gmail.com',
-      'gmail.cm': 'gmail.com',
-      'gmail.co': 'gmail.com',
-      'gamil.com': 'gmail.com',
-      'hotmial.com': 'hotmail.com',
-      'hotmail.cm': 'hotmail.com',
-      'yahoo.cm': 'yahoo.com',
-      'yaho.com': 'yahoo.com',
-      'outlook.cm': 'outlook.com',
-      'outlok.com': 'outlook.com'
-    };
-    
-    this.australianTlds = ['.com.au', '.net.au', '.org.au', '.edu.au', '.gov.au', '.asn.au', '.id.au', '.au'];
-    
-    // Extended list of common domains for local validation
-    this.commonValidDomains = [
-      'gmail.com', 'outlook.com', 'hotmail.com', 'yahoo.com', 'icloud.com', 
-      'aol.com', 'protonmail.com', 'fastmail.com', 'mail.com', 'zoho.com',
-      'yandex.com', 'gmx.com', 'live.com', 'msn.com', 'me.com', 'mac.com', 
-      'googlemail.com', 'pm.me', 'tutanota.com', 'mailbox.org'
-    ];
+    // Initialize domain correction features
+    this.config.removeGmailAliases = config.removeGmailAliases !== false; // Default to true
     
     // Client ID for um_check_id generation
     this.clientId = config.clientId || '00001';
@@ -203,6 +180,271 @@ export class EmailValidationService {
     
     // Format: lastSixDigits + clientId + checkDigit + version
     return `${lastSixDigits}${clientId}${checkDigit}${this.umessyVersion}`;
+  }
+  
+  // Check if a domain is in the invalid domains table
+  async checkInvalidDomain(domain) {
+    if (!this.supabaseEnabled || !this.supabase || !domain) {
+      console.log('DB_CHECK_INVALID_DOMAIN: Supabase not enabled or no domain provided');
+      return false;
+    }
+    
+    // Ensure connection is established
+    if (this.supabaseConnectionStatus === 'pending' || this.supabaseConnectionStatus === 'initializing') {
+      try {
+        console.log('DB_CHECK_INVALID_DOMAIN: Testing connection before check');
+        await this._testSupabaseConnectionAsync();
+      } catch (error) {
+        console.error('DB_CHECK_INVALID_DOMAIN: Connection test failed', { error: error.message });
+        return false;
+      }
+    }
+    
+    if (this.supabaseConnectionStatus !== 'connected') {
+      console.log('DB_CHECK_INVALID_DOMAIN: Supabase not connected, skipping check', {
+        connectionStatus: this.supabaseConnectionStatus
+      });
+      return false;
+    }
+    
+    try {
+      console.log('DB_CHECK_INVALID_DOMAIN: Checking if domain is in invalid_domains table', { domain });
+      
+      const { data, error } = await this.supabase
+        .from('invalid_domains')
+        .select('id')
+        .eq('domain', domain)
+        .maybeSingle();
+      
+      if (error) {
+        console.error('DB_CHECK_INVALID_DOMAIN_ERROR: Query error', {
+          error: error.message,
+          code: error.code,
+          domain
+        });
+        return false;
+      }
+      
+      const isInvalid = !!data;
+      
+      console.log('DB_CHECK_INVALID_DOMAIN: Check completed', {
+        domain,
+        isInvalid,
+        found: isInvalid
+      });
+      
+      return isInvalid;
+    } catch (error) {
+      console.error('DB_CHECK_INVALID_DOMAIN_ERROR: Exception during check', {
+        error: error.message,
+        stack: error.stack,
+        domain
+      });
+      return false;
+    }
+  }
+  
+  // Check if a domain is in the common valid domains table
+  async checkCommonValidDomain(domain) {
+    if (!this.supabaseEnabled || !this.supabase || !domain) {
+      console.log('DB_CHECK_COMMON_VALID_DOMAIN: Supabase not enabled or no domain provided');
+      return false;
+    }
+    
+    // Ensure connection is established
+    if (this.supabaseConnectionStatus === 'pending' || this.supabaseConnectionStatus === 'initializing') {
+      try {
+        console.log('DB_CHECK_COMMON_VALID_DOMAIN: Testing connection before check');
+        await this._testSupabaseConnectionAsync();
+      } catch (error) {
+        console.error('DB_CHECK_COMMON_VALID_DOMAIN: Connection test failed', { error: error.message });
+        return false;
+      }
+    }
+    
+    if (this.supabaseConnectionStatus !== 'connected') {
+      console.log('DB_CHECK_COMMON_VALID_DOMAIN: Supabase not connected, skipping check', {
+        connectionStatus: this.supabaseConnectionStatus
+      });
+      return false;
+    }
+    
+    try {
+      console.log('DB_CHECK_COMMON_VALID_DOMAIN: Checking if domain is in common_valid_domains table', { domain });
+      
+      const { data, error } = await this.supabase
+        .from('common_valid_domains')
+        .select('id')
+        .eq('domain', domain)
+        .maybeSingle();
+      
+      if (error) {
+        console.error('DB_CHECK_COMMON_VALID_DOMAIN_ERROR: Query error', {
+          error: error.message,
+          code: error.code,
+          domain
+        });
+        return false;
+      }
+      
+      const isCommonValid = !!data;
+      
+      console.log('DB_CHECK_COMMON_VALID_DOMAIN: Check completed', {
+        domain,
+        isCommonValid,
+        found: isCommonValid
+      });
+      
+      return isCommonValid;
+    } catch (error) {
+      console.error('DB_CHECK_COMMON_VALID_DOMAIN_ERROR: Exception during check', {
+        error: error.message,
+        stack: error.stack,
+        domain
+      });
+      return false;
+    }
+  }
+  
+  // Check if a domain has a typo and get the correction
+  async checkDomainTypo(domain) {
+    if (!this.supabaseEnabled || !this.supabase || !domain) {
+      console.log('DB_CHECK_DOMAIN_TYPO: Supabase not enabled or no domain provided');
+      return null;
+    }
+    
+    // Ensure connection is established
+    if (this.supabaseConnectionStatus === 'pending' || this.supabaseConnectionStatus === 'initializing') {
+      try {
+        console.log('DB_CHECK_DOMAIN_TYPO: Testing connection before check');
+        await this._testSupabaseConnectionAsync();
+      } catch (error) {
+        console.error('DB_CHECK_DOMAIN_TYPO: Connection test failed', { error: error.message });
+        return null;
+      }
+    }
+    
+    if (this.supabaseConnectionStatus !== 'connected') {
+      console.log('DB_CHECK_DOMAIN_TYPO: Supabase not connected, skipping check', {
+        connectionStatus: this.supabaseConnectionStatus
+      });
+      return null;
+    }
+    
+    try {
+      console.log('DB_CHECK_DOMAIN_TYPO: Checking if domain has a typo correction', { domain });
+      
+      const { data, error } = await this.supabase
+        .from('domain_typos')
+        .select('correct_domain')
+        .eq('typo_domain', domain)
+        .maybeSingle();
+      
+      if (error) {
+        console.error('DB_CHECK_DOMAIN_TYPO_ERROR: Query error', {
+          error: error.message,
+          code: error.code,
+          domain
+        });
+        return null;
+      }
+      
+      const correction = data ? data.correct_domain : null;
+      
+      console.log('DB_CHECK_DOMAIN_TYPO: Check completed', {
+        domain,
+        hasCorrection: !!correction,
+        correction
+      });
+      
+      return correction;
+    } catch (error) {
+      console.error('DB_CHECK_DOMAIN_TYPO_ERROR: Exception during check', {
+        error: error.message,
+        stack: error.stack,
+        domain
+      });
+      return null;
+    }
+  }
+  
+  // Check if the domain has a TLD that needs correction
+  async checkTldCorrection(domain) {
+    if (!this.supabaseEnabled || !this.supabase || !domain) {
+      console.log('DB_CHECK_TLD_CORRECTION: Supabase not enabled or no domain provided');
+      return null;
+    }
+    
+    // Ensure connection is established
+    if (this.supabaseConnectionStatus === 'pending' || this.supabaseConnectionStatus === 'initializing') {
+      try {
+        console.log('DB_CHECK_TLD_CORRECTION: Testing connection before check');
+        await this._testSupabaseConnectionAsync();
+      } catch (error) {
+        console.error('DB_CHECK_TLD_CORRECTION: Connection test failed', { error: error.message });
+        return null;
+      }
+    }
+    
+    if (this.supabaseConnectionStatus !== 'connected') {
+      console.log('DB_CHECK_TLD_CORRECTION: Supabase not connected, skipping check', {
+        connectionStatus: this.supabaseConnectionStatus
+      });
+      return null;
+    }
+    
+    try {
+      console.log('DB_CHECK_TLD_CORRECTION: Checking if domain has TLD issues', { domain });
+      
+      // Get all TLDs from the database
+      const { data: tldData, error: tldError } = await this.supabase
+        .from('valid_tlds')
+        .select('tld');
+      
+      if (tldError) {
+        console.error('DB_CHECK_TLD_CORRECTION_ERROR: Query error', {
+          error: tldError.message,
+          code: tldError.code,
+          domain
+        });
+        return null;
+      }
+      
+      if (!tldData || tldData.length === 0) {
+        console.log('DB_CHECK_TLD_CORRECTION: No TLDs found in database');
+        return null;
+      }
+      
+      // Check each TLD for potential corrections
+      for (const row of tldData) {
+        const tld = row.tld;
+        const tldNoDot = tld.replace(/\./g, '');
+        
+        if (domain.endsWith(tldNoDot) && !domain.endsWith(tld)) {
+          const index = domain.lastIndexOf(tldNoDot);
+          const correctedDomain = domain.substring(0, index) + tld;
+          
+          console.log('DB_CHECK_TLD_CORRECTION: Found TLD correction', {
+            domain,
+            tld,
+            tldNoDot,
+            correctedDomain
+          });
+          
+          return correctedDomain;
+        }
+      }
+      
+      console.log('DB_CHECK_TLD_CORRECTION: No TLD issues found', { domain });
+      return null;
+    } catch (error) {
+      console.error('DB_CHECK_TLD_CORRECTION_ERROR: Exception during check', {
+        error: error.message,
+        stack: error.stack,
+        domain
+      });
+      return null;
+    }
   }
   
   // Non-blocking Supabase check - doesn't throw, returns false on failure
@@ -363,7 +605,7 @@ export class EmailValidationService {
           contactId: existingRecord.contact_id
         });
         
-        // Prepare update data - REMOVED client_id field
+        // Prepare update data
         const updateData = {
           date_last_um_check: validationResult.date_last_um_check || now.toISOString(),
           date_last_um_check_epoch: validationResult.date_last_um_check_epoch || Math.floor(now.getTime() / 1000),
@@ -429,7 +671,7 @@ export class EmailValidationService {
         throw contactError;
       }
       
-      // Now insert the email validation record - REMOVED client_id field
+      // Now insert the email validation record
       const validationData = {
         contact_id: contactId,
         date_last_um_check: validationResult.date_last_um_check || now.toISOString(),
@@ -493,8 +735,8 @@ export class EmailValidationService {
     return emailRegex.test(email);
   }
   
-  // Typo correction - fast and synchronous
-  correctEmailTypos(email) {
+  // Updated email typo correction with database checks
+  async correctEmailTypos(email) {
     if (!email) {
       return { corrected: false, email };
     }
@@ -509,52 +751,69 @@ export class EmailValidationService {
       corrected = true;
     }
     
-    // Check for domain typos
+    // Check for domain typos from database
     const [localPart, domain] = cleanedEmail.split('@');
     
-    if (domain && this.domainTypos[domain]) {
-      cleanedEmail = `${localPart}@${this.domainTypos[domain]}`;
-      corrected = true;
-    }
-    
-    // Handle Gmail aliases
-    if (this.config.removeGmailAliases && domain === 'gmail.com' && localPart.includes('+')) {
-      const baseLocal = localPart.split('+')[0];
-      cleanedEmail = `${baseLocal}@gmail.com`;
-      corrected = true;
-    }
-    
-    // Check Australian TLDs
-    if (this.config.checkAustralianTlds) {
-      for (const tld of this.australianTlds) {
-        const tldNoDot = tld.replace(/\./g, '');
-        if (domain && domain.endsWith(tldNoDot) && !domain.endsWith(tld)) {
-          const index = domain.lastIndexOf(tldNoDot);
-          const newDomain = domain.substring(0, index) + tld;
-          cleanedEmail = `${localPart}@${newDomain}`;
-          corrected = true;
-          break;
-        }
+    if (domain) {
+      // Check for domain typo correction
+      const correctedDomain = await this.checkDomainTypo(domain);
+      if (correctedDomain) {
+        cleanedEmail = `${localPart}@${correctedDomain}`;
+        corrected = true;
+      }
+      
+      // Handle Gmail aliases
+      if (this.config.removeGmailAliases && domain === 'gmail.com' && localPart.includes('+')) {
+        const baseLocal = localPart.split('+')[0];
+        cleanedEmail = `${baseLocal}@gmail.com`;
+        corrected = true;
+      }
+      
+      // Check for TLD corrections from database
+      const [, domainAfterCorrection] = cleanedEmail.split('@');
+      const tldCorrectedDomain = await this.checkTldCorrection(domainAfterCorrection);
+      if (tldCorrectedDomain) {
+        cleanedEmail = `${localPart}@${tldCorrectedDomain}`;
+        corrected = true;
       }
     }
     
     return { corrected, email: cleanedEmail };
   }
   
-  // Fast domain check - synchronous
-  isValidDomain(email) {
+  // Updated domain validity check with database lookup
+  async isValidDomain(email) {
     try {
       const domain = email.split('@')[1];
       if (!domain) return false;
-      return this.commonValidDomains.includes(domain);
+      
+      // First check if it's in the invalid domains list
+      const isInvalid = await this.checkInvalidDomain(domain);
+      if (isInvalid) {
+        console.log('DOMAIN_VALIDITY_CHECK: Domain is in invalid domains list', { domain });
+        return false;
+      }
+      
+      // Then check if it's in the common valid domains list
+      const isCommonValid = await this.checkCommonValidDomain(domain);
+      console.log('DOMAIN_VALIDITY_CHECK: Domain validity check completed', { 
+        domain, 
+        isValid: isCommonValid 
+      });
+      
+      return isCommonValid;
     } catch (error) {
+      console.error('DOMAIN_VALIDITY_CHECK_ERROR: Exception during check', {
+        error: error.message,
+        email
+      });
       return false;
     }
   }
   
-  // Fast local validation without external services
-  quickValidate(email, clientId = null) {
-    // Step 1: Format check
+  // Quick validation with database checks for domain validity
+  async quickValidate(email, clientId = null) {
+    // Step 1: Format check (synchronous)
     const formatValid = this.isValidEmailFormat(email);
     if (!formatValid) {
       return {
@@ -569,11 +828,51 @@ export class EmailValidationService {
       };
     }
     
-    // Step 2: Correct typos
-    const { corrected, email: correctedEmail } = this.correctEmailTypos(email);
+    // Step 2: Correct typos (now async with database checks)
+    const { corrected, email: correctedEmail } = await this.correctEmailTypos(email);
     
-    // Step 3: Domain check
-    const domainValid = this.isValidDomain(correctedEmail);
+    // Extract domain for further checks
+    const domain = correctedEmail.split('@')[1];
+    
+    // Step 3: Check if domain is in invalid domains list (async)
+    const isInvalidDomain = await this.checkInvalidDomain(domain);
+    
+    // If domain is in invalid domains list, mark as invalid and skip further checks
+    if (isInvalidDomain) {
+      console.log('QUICK_VALIDATE: Domain is invalid (in invalid_domains table)', { domain });
+      
+      // Generate um_check_id and timestamps
+      const umCheckId = this.generateUmCheckId(clientId);
+      const now = new Date();
+      
+      return {
+        originalEmail: email,
+        currentEmail: correctedEmail,
+        formatValid: true,
+        wasCorrected: corrected,
+        domainValid: false,
+        isInvalidDomain: true,
+        status: 'invalid',
+        subStatus: 'invalid_domain',
+        recheckNeeded: false,
+        validationSteps: [
+          { step: 'format_check', passed: true },
+          { step: 'typo_correction', applied: corrected, original: email, corrected: correctedEmail },
+          { step: 'invalid_domain_check', passed: false, domain: domain }
+        ],
+        // Add unmessy specific fields
+        date_last_um_check: now.toISOString(),
+        date_last_um_check_epoch: Math.floor(now.getTime() / 1000),
+        um_check_id: umCheckId,
+        um_email: correctedEmail,
+        email: email,
+        um_email_status: corrected ? 'Changed' : 'Unchanged',
+        um_bounce_status: 'Likely to bounce'
+      };
+    }
+    
+    // Step 4: Check if domain is in common valid domains list (async)
+    const domainValid = await this.isValidDomain(correctedEmail);
     const status = domainValid ? 'valid' : 'unknown';
     
     // Generate um_check_id
@@ -755,13 +1054,13 @@ export class EmailValidationService {
   }
   
   // Save data synchronously during the validation process
-  // This is a critical change to fix the data saving issue
+  // Modified to use database checks for domain validation
   async validateEmail(email, options = {}) {
     const { 
       skipZeroBounce = false, 
       timeoutMs = this.timeouts.validation, 
       isRetry = false,
-      clientId = null  // New parameter to track which client made the request
+      clientId = null  // Parameter to track which client made the request
     } = options;
     
     console.log('VALIDATION_PROCESS: Starting validation for email', { 
@@ -773,12 +1072,21 @@ export class EmailValidationService {
       supabaseStatus: this.supabaseConnectionStatus
     });
     
-    // Start with quick validation (synchronous, always works)
-    const quickResult = this.quickValidate(email, clientId);
+    // Start with quick validation (now async with database checks)
+    const quickResult = await this.quickValidate(email, clientId);
     
     // If format is invalid, return immediately
     if (!quickResult.formatValid) {
       console.log('VALIDATION_PROCESS: Invalid format detected, returning quick result');
+      return quickResult;
+    }
+    
+    // If domain is invalid (in invalid_domains table), return immediately and skip ZeroBounce
+    if (quickResult.isInvalidDomain) {
+      console.log('VALIDATION_PROCESS: Domain is in invalid domains list, returning invalid without ZeroBounce check', {
+        email: quickResult.currentEmail,
+        domain: quickResult.currentEmail.split('@')[1]
+      });
       return quickResult;
     }
     
@@ -862,6 +1170,33 @@ export class EmailValidationService {
                 originalEmail: email,
                 suggestedEmail: bounceCheck.suggestedEmail
               });
+              
+              // Before revalidating, check if the suggested domain is in the invalid domains list
+              const suggestedDomain = bounceCheck.suggestedEmail.split('@')[1];
+              const isSuggestedDomainInvalid = await this.checkInvalidDomain(suggestedDomain);
+              
+              if (isSuggestedDomainInvalid) {
+                console.log('VALIDATION_PROCESS: ZeroBounce suggested domain is in invalid domains list, ignoring suggestion', {
+                  suggestedEmail: bounceCheck.suggestedEmail,
+                  suggestedDomain
+                });
+                
+                // Update the result to indicate invalid domain
+                result.status = 'invalid';
+                result.subStatus = 'invalid_domain';
+                result.recheckNeeded = false;
+                result.um_bounce_status = 'Likely to bounce';
+                
+                result.validationSteps.push({
+                  step: 'zerobounce_suggestion',
+                  original: email,
+                  suggested: bounceCheck.suggestedEmail,
+                  suggestedDomainInvalid: true,
+                  result: 'invalid'
+                });
+                
+                return result;
+              }
               
               // Recursive call with the suggested email, but mark as a retry to prevent infinite loops
               const suggestedEmailResult = await this.validateEmail(bounceCheck.suggestedEmail, {
@@ -995,12 +1330,12 @@ export class EmailValidationService {
     }
   }
   
-  // Batch validation with time budget management
+  // Batch validation with time budget management - updated to work with async quickValidate
   async validateBatch(emails, options = {}) {
     const { 
       skipZeroBounce = false, 
       timeoutPerEmailMs = 2000,
-      clientId = null  // New parameter to track which client made the request
+      clientId = null  // Parameter to track which client made the request
     } = options;
     
     console.log('BATCH_VALIDATION: Starting batch validation', { 
@@ -1029,7 +1364,7 @@ export class EmailValidationService {
         
         // Process remaining emails with quick validation
         for (let j = i; j < emails.length; j++) {
-          results.push(this.quickValidate(emails[j], clientId));
+          results.push(await this.quickValidate(emails[j], clientId));
         }
         break;
       }
@@ -1051,7 +1386,7 @@ export class EmailValidationService {
         });
         
         // Fall back to quick validation
-        results.push(this.quickValidate(email, clientId));
+        results.push(await this.quickValidate(email, clientId));
       }
     }
     
@@ -1062,132 +1397,5 @@ export class EmailValidationService {
     });
     
     return results;
-  }
-  
-  // Update HubSpot contact with proper timeout handling
-  async updateHubSpotContact(contactId, validationResult, clientId = null) {
-    console.log('HUBSPOT_UPDATE: Starting contact update', {
-      contactId,
-      validationStatus: validationResult.status,
-      email: validationResult.currentEmail,
-      clientId: clientId || 'default'
-    });
-    
-    if (!this.config.hubspot?.apiKey) {
-      console.error('HUBSPOT_UPDATE: API key not configured');
-      return {
-        success: false,
-        contactId,
-        error: 'HubSpot API key not configured'
-      };
-    }
-
-    try {
-      console.log('HUBSPOT_UPDATE: Preparing properties for update');
-      
-      return await this.withTimeout(
-        async (signal) => {
-          // Prepare properties to update
-          const properties = {
-            email: validationResult.currentEmail,
-            email_status: validationResult.status,
-            email_recheck_needed: validationResult.recheckNeeded,
-            email_check_date: new Date().toISOString(),
-            
-            // Include Unmessy specific fields
-            um_email_status: validationResult.um_email_status,
-            um_bounce_status: validationResult.um_bounce_status,
-            date_last_um_check: validationResult.date_last_um_check,
-            um_check_id: validationResult.um_check_id,
-            
-            // Add client ID that performed the validation
-            validation_client_id: clientId || this.clientId
-          };
-          
-          // Add original email if corrected (either by built-in corrections or ZeroBounce suggestion)
-          if (validationResult.wasCorrected) {
-            properties.original_email = validationResult.originalEmail;
-            properties.email_corrected = true;
-            
-            // If correction was due to ZeroBounce suggestion, add that info
-            if (validationResult.validationSteps?.some(step => step.step === 'zerobounce_suggestion')) {
-              properties.email_correction_source = 'zerobounce';
-              
-              const suggestionStep = validationResult.validationSteps?.find(
-                step => step.step === 'zerobounce_suggestion'
-              );
-              
-              if (suggestionStep) {
-                properties.email_suggested_by_zerobounce = true;
-                properties.email_suggestion_original = suggestionStep.original;
-              }
-            } else {
-              properties.email_correction_source = 'internal';
-            }
-          }
-          
-          if (validationResult.subStatus) {
-            properties.email_sub_status = validationResult.subStatus;
-          }
-          
-          console.log('HUBSPOT_UPDATE: Sending update request', {
-            contactId,
-            properties: Object.keys(properties).join(', '),
-            clientId: clientId || 'default'
-          });
-          
-          // Send update request
-          const response = await fetch(
-            `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}`,
-            {
-              method: 'PATCH',
-              headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${this.config.hubspot.apiKey}`
-              },
-              body: JSON.stringify({ properties }),
-              signal
-            }
-          );
-          
-          console.log('HUBSPOT_UPDATE: Received response', {
-            contactId,
-            status: response.status,
-            statusText: response.statusText
-          });
-          
-          if (!response.ok) {
-            throw new Error(`HubSpot API error: ${response.status} ${response.statusText}`);
-          }
-          
-          const data = await response.json();
-          
-          console.log('HUBSPOT_UPDATE: Successfully updated contact', {
-            contactId,
-            responseId: data.id,
-            clientId: clientId || 'default'
-          });
-          
-          return {
-            success: true,
-            contactId,
-            hubspotResponse: data
-          };
-        },
-        this.timeouts.hubspot,
-        'HubSpot update timeout'
-      );
-    } catch (error) {
-      console.error('HUBSPOT_UPDATE_ERROR:', { 
-        message: error.message, 
-        contactId,
-        clientId: clientId || 'default'
-      });
-      return {
-        success: false,
-        contactId,
-        error: error.message
-      };
-    }
   }
 }

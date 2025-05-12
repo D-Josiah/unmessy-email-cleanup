@@ -10,6 +10,7 @@ dotenv.config();
 const config = {
   useZeroBounce: false, // Not needed for background operations
   zeroBounceApiKey: process.env.ZERO_BOUNCE_API_KEY || '',
+  zeroBounceMaxRetries: parseInt(process.env.ZERO_BOUNCE_MAX_RETRIES || '1', 10),
   removeGmailAliases: true,
   checkAustralianTlds: true,
   useSupabase: true, // Always enable for background processor
@@ -38,8 +39,10 @@ const config = {
   umessyVersion: process.env.UMESSY_VERSION || '100',
   // Much longer timeouts for background processing
   timeouts: {
-    supabase: 20000,      // 20 seconds for Supabase operations
-    validation: 25000     // 25 seconds for overall validation
+    supabase: 20000,        // 20 seconds for Supabase operations
+    zeroBounce: 10000,      // 10 seconds for ZeroBounce operations
+    zeroBounceRetry: 15000, // 15 seconds for ZeroBounce retry operations
+    validation: 25000       // 25 seconds for overall validation
   }
 };
 
@@ -93,6 +96,21 @@ async function processValidationSave(payload) {
       return { success: false, error: 'Supabase not connected' };
     }
     
+    // UPDATED: Ensure date formats are correct when saving
+    // If the date is in old format (ISO string), convert to new format
+    if (validationResult.date_last_um_check && typeof validationResult.date_last_um_check === 'string' 
+        && validationResult.date_last_um_check.includes('T')) {
+      // Convert ISO format to spelled-out date
+      const date = new Date(validationResult.date_last_um_check);
+      validationResult.date_last_um_check = emailValidator.formatDateString(date);
+    }
+    
+    // If epoch is in seconds, convert to milliseconds
+    if (validationResult.date_last_um_check_epoch && validationResult.date_last_um_check_epoch < 10000000000) {
+      // Likely seconds format - convert to milliseconds
+      validationResult.date_last_um_check_epoch = validationResult.date_last_um_check_epoch * 1000;
+    }
+    
     // Save result to Supabase
     const saveResult = await emailValidator.saveValidationResult(email, validationResult);
     
@@ -108,3 +126,8 @@ async function processValidationSave(payload) {
       email,
       error: error.message,
       stack: error.stack
+    });
+    
+    return { success: false, error: error.message };
+  }
+}
