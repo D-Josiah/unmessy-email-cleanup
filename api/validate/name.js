@@ -1,4 +1,4 @@
-// api/validate/name.js
+// api/validate/name.js - Fixed circular dependency issue
 import { NameValidationService } from '../../src/services/name-validator.js';
 import { ClientManagerService } from '../../src/services/client-manager.js';
 import dotenv from 'dotenv';
@@ -179,16 +179,21 @@ export default async function handler(req, res) {
         // For names with particles like "von", update the um_last_name to include the particle
         // IMPORTANT: Keep the particle lowercase when it was in middle position
         // This maintains traditional formatting (e.g., "Ludwig von Beethoven" not "Ludwig Von Beethoven")
-        const middleNameParticle = result.middleName.toLowerCase();
-        const updatedLastName = `${middleNameParticle} ${result.lastName}`;
+        
+        // Get the particle in lowercase and the capitalized last name, avoiding properCapitalize()
+        // which would incorrectly capitalize particles at the beginning of last names
+        const particle = result.middleName.toLowerCase();
+        
+        // Manually construct the combined last name keeping the particle lowercase
+        const combinedLastName = `${particle} ${result.lastName}`;
         
         formattedFirstName = result.honorific 
           ? `${result.honorific} ${result.firstName}`.trim() 
           : result.firstName;
           
         formattedLastName = result.suffix 
-          ? `${updatedLastName} ${result.suffix}`.trim() 
-          : updatedLastName;
+          ? `${combinedLastName} ${result.suffix}`.trim() 
+          : combinedLastName;
           
         formattedMiddleName = ''; // No middle name since it's now part of the last name
       } else {
