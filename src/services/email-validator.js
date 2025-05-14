@@ -41,7 +41,6 @@ export class EmailValidationService {
       });
       this.supabaseConnectionStatus = 'disabled';
     }
-    
     // Initialize Supabase client if enabled
     if (this.supabaseEnabled) {
       try {
@@ -102,7 +101,6 @@ export class EmailValidationService {
     // Configure ZeroBounce retry settings
     this.zeroBounceMaxRetries = config.zeroBounceMaxRetries || 1; // Default to 1 retry
   }
-
   // Asynchronous test without blocking operations
   async _testSupabaseConnectionAsync() {
     if (!this.supabase) {
@@ -168,26 +166,15 @@ export class EmailValidationService {
       throw error;
     }
   }
-  
-  // UPDATED: Format date as spelled out date instead of ISO format
+  // UPDATED: Format date as ISO string instead of spelled out date
   formatDateString(date) {
-    const options = { 
-      weekday: 'long',
-      year: 'numeric', 
-      month: 'long', 
-      day: 'numeric',
-      hour: 'numeric',
-      minute: 'numeric',
-      second: 'numeric',
-      timeZoneName: 'short'
-    };
-    
-    return date.toLocaleDateString('en-US', options);
+    // Return ISO date format
+    return date.toISOString();
   }
   
-  // UPDATED: Generate um_check_id based on specification using milliseconds for uniqueness
+  // UPDATED: Generate um_check_id as a number instead of string
   generateUmCheckId(customClientId = null) {
-    // Use milliseconds instead of seconds for greater uniqueness
+    // Use milliseconds for uniqueness
     const epochTime = Date.now(); // This gives milliseconds
     const lastSixDigits = String(epochTime).slice(-6);
     
@@ -200,7 +187,8 @@ export class EmailValidationService {
     const checkDigit = String(sum * parseInt(clientId)).padStart(3, '0');
     
     // Format: lastSixDigits + clientId + checkDigit + version
-    return `${lastSixDigits}${clientId}${checkDigit}${this.umessyVersion}`;
+    // Convert to number by using Number()
+    return Number(`${lastSixDigits}${clientId}${checkDigit}${this.umessyVersion}`);
   }
   
   // Check if a domain is in the invalid domains table
@@ -289,7 +277,6 @@ export class EmailValidationService {
       });
       return false;
     }
-    
     try {
       console.log('DB_CHECK_COMMON_VALID_DOMAIN: Checking if domain is in common_valid_domains table', { domain });
       
@@ -395,7 +382,6 @@ export class EmailValidationService {
       console.log('DB_CHECK_TLD_CORRECTION: Supabase not enabled or no domain provided');
       return null;
     }
-    
     // Ensure connection is established
     if (this.supabaseConnectionStatus === 'pending' || this.supabaseConnectionStatus === 'initializing') {
       try {
@@ -581,7 +567,7 @@ export class EmailValidationService {
       const umCheckId = validationResult.um_check_id || this.generateUmCheckId(clientId);
       const now = new Date();
       
-      // UPDATED: Format date as spelled out date and use milliseconds for epoch
+      // UPDATED: Format date as ISO string and use milliseconds for epoch
       const formattedDate = this.formatDateString(now);
       const epochTimeMs = now.getTime(); // Use full milliseconds for uniqueness
       
@@ -1186,7 +1172,6 @@ export class EmailValidationService {
           
           // Start with the quick result and enhance it
           const result = { ...quickResult };
-          
           // Add Supabase result if successful - this is the database fallback
           if (knownValidResult.status === 'fulfilled' && knownValidResult.value.found) {
             console.log('VALIDATION_PROCESS: Email found in Supabase database, marking as valid', { 
