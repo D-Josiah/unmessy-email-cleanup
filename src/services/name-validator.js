@@ -629,8 +629,14 @@ export class NameValidationService {
           this.isNameParticle(remainingComponents[middleIndex])) {
         // If there's a particle, it's part of the last name
         // E.g. "Ludwig von Beethoven" -> firstName: "Ludwig", lastName: "von Beethoven"
-        result.lastName = remainingComponents.slice(middleIndex).join(' ');
-        result.lastName = this.properCapitalize(result.lastName, true);
+        
+        // IMPORTANT FIX: Keep the particle lowercase when it comes from middle position
+        const particle = remainingComponents[middleIndex].toLowerCase();
+        const actualLastName = remainingComponents.slice(middleIndex + 1).join(' ');
+        const capitalizedLastName = this.properCapitalize(actualLastName, true);
+        
+        // Manually combine to preserve lowercase particle
+        result.lastName = `${particle} ${capitalizedLastName}`;
       } else {
         // Standard case: first name, middle name(s), last name
         result.lastName = this.properCapitalize(remainingComponents[remainingComponents.length - 1], true);
