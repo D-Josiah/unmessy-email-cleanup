@@ -1,662 +1,350 @@
-// src/services/name-validator.js - Updated to handle name particles properly
-export class NameValidationService {
-  constructor(config) {
-    this.config = config;
-    
-    // Detailed logging for initialization
-    console.log('NAME_VALIDATOR_INIT: Initializing name validation service');
-    
-    // Common honorifics (stored lowercase for matching)
-    this.honorifics = new Set([
-      'mr', 'mrs', 'ms', 'miss', 'dr', 'prof', 'rev', 'hon', 'sir', 'madam', 
-      'lord', 'lady', 'capt', 'major', 'col', 'lt', 'cmdr', 'sgt'
-    ]);
-    
-    // Common name suffixes (stored lowercase for matching, but will be output with proper capitalization and periods)
-    this.suffixes = new Set([
-      'jr', 'sr', 'i', 'ii', 'iii', 'iv', 'v', 'phd', 'md', 'dds', 'esq'
-    ]);
-    
-    // Suffix formatting map (how each suffix should be displayed)
-    this.suffixFormatting = new Map([
-      ['jr', 'Jr.'],
-      ['sr', 'Sr.'],
-      ['i', 'I'],
-      ['ii', 'II'],
-      ['iii', 'III'],
-      ['iv', 'IV'],
-      ['v', 'V'],
-      ['phd', 'Ph.D.'],
-      ['md', 'M.D.'],
-      ['dds', 'D.D.S.'],
-      ['esq', 'Esq.']
-    ]);
-    
-    // Name particles that should not be capitalized conventionally in middle positions
-    // and should be considered part of the last name
-    this.nameParticles = new Set([
-      'von', 'van', 'de', 'del', 'della', 'di', 'da', 'do', 'dos', 'das', 'du', 
-      'la', 'le', 'el', 'les', 'lo', 'mac', 'mc', "o'", 'al', 'bin', 'ibn', 
-      'ap', 'ben', 'bat', 'bint'
-    ]);
-    
-    // Test/suspicious names
-    this.suspiciousNames = new Set([
-      'test', 'user', 'admin', 'sample', 'demo', 'fake', 'anonymous', 'unknown', 
-      'noreply', 'example', 'null', 'undefined', 'n/a', 'na', 'none', 'blank'
-    ]);
-    
-    // Security patterns to check for
-    this.securityPatterns = new Set([
-      ');', '--', '/*', '*/', ';', 'drop', 'select', 'insert', 'update', 'delete', 
-      'union', 'script', '<>'
-    ]);
-    
-    // Special case name corrections - these take precedence over general rules
-    // The exact capitalization specified here will be preserved
-    this.specialCaseCorrections = new Map([
-      ['obrien', "O'Brien"],
-      ['oneill', "O'Neill"],
-      ['odonnell', "O'Donnell"],
-      ['mcdonald', 'McDonald'],
-      ['macleod', 'MacLeod'],
-      ['vanhalen', 'Van Halen'],
-      ['desouza', 'De Souza'],
-      ['delafuente', 'De la Fuente']
-    ]);
-    
-    console.log('NAME_VALIDATOR_INIT: Reference data initialized successfully', {
-      honorifics: this.honorifics.size,
-      suffixes: this.suffixes.size,
-      nameParticles: this.nameParticles.size,
-      suspiciousNames: this.suspiciousNames.size,
-      securityPatterns: this.securityPatterns.size,
-      specialCaseCorrections: this.specialCaseCorrections.size
-    });
+// api/validate/name.js
+import { NameValidationService } from '../../src/services/name-validator.js';
+import { ClientManagerService } from '../../src/services/client-manager.js';
+import dotenv from 'dotenv';
+
+// Load environment variables
+dotenv.config();
+
+// Detailed logging for configuration and connection status
+console.log('=============================================');
+console.log('NAME VALIDATION API STARTUP');
+console.log('=============================================');
+
+// Log environment variables (safely)
+console.log('ENVIRONMENT VARIABLES CHECK:', {
+  clientIdSet: !!process.env.CLIENT_ID,
+  umessyVersionSet: !!process.env.UMESSY_VERSION,
+  nodeEnv: process.env.NODE_ENV || 'not set'
+});
+
+// Determine if we're running in Vercel
+const isVercel = !!process.env.VERCEL || !!process.env.VERCEL_URL;
+console.log('RUNTIME ENVIRONMENT:', {
+  isVercel,
+  vercelRegion: process.env.VERCEL_REGION || 'unknown',
+  platform: process.platform,
+  nodeVersion: process.version
+});
+
+// Load configuration with explicit values and defaults
+const config = {
+  // Name processing settings
+  fixCommonNameErrors: true,
+  
+  // Default rate limit (overridden by client-specific settings)
+  defaultDailyLimit: 1000,
+  
+  // ID generation settings
+  clientId: process.env.CLIENT_ID || '00001',
+  umessyVersion: process.env.UMESSY_VERSION || '100',
+  
+  // Timeouts
+  timeouts: {
+    validation: 5000,         // 5 seconds for validation (names are fast)
+  }
+};
+
+// Log the configuration
+console.log('API CONFIGURATION:', {
+  fixCommonNameErrors: config.fixCommonNameErrors,
+  defaultDailyLimit: config.defaultDailyLimit,
+  timeouts: config.timeouts,
+  clientId: config.clientId,
+  umessyVersion: config.umessyVersion
+});
+
+// Initialize the client manager service
+const clientManager = new ClientManagerService(config.defaultDailyLimit);
+
+// Log loaded clients
+console.log(`CLIENT MANAGER: Loaded ${clientManager.clients.size} client API keys with default rate limit of ${config.defaultDailyLimit} requests/day`);
+
+// Initialize the name validation service
+const nameValidator = new NameValidationService(config);
+
+// Main API handler function
+export default async function handler(req, res) {
+  // Health check endpoint
+  if (req.url && req.url.endsWith('/health')) {
+    return healthCheck(req, res);
   }
   
-  // Helper function to detect script/language and handle character encoding issues
-  detectScript(text) {
-    if (!text || typeof text !== 'string') return 'unknown';
-    
-    // Check for character encoding issues
-    if (text.includes('�') || /\uFFFD/.test(text)) {
-      return 'encoding-issue';
-    }
-    
-    // Check for commonly used scripts
-    const scripts = {
-      cyrillic: /[\u0400-\u04FF]/,                   // Russian, Ukrainian, etc.
-      devanagari: /[\u0900-\u097F]/,                 // Hindi, Sanskrit, etc.
-      arabic: /[\u0600-\u06FF\u0750-\u077F]/,        // Arabic, Persian, etc.
-      han: /[\u4E00-\u9FFF\u3400-\u4DBF]/,           // Chinese, Japanese Kanji
-      hiragana: /[\u3040-\u309F]/,                   // Japanese
-      katakana: /[\u30A0-\u30FF]/,                   // Japanese
-      hangul: /[\uAC00-\uD7AF\u1100-\u11FF]/,        // Korean
-      thai: /[\u0E00-\u0E7F]/                        // Thai
-    };
-    
-    for (const [script, regex] of Object.entries(scripts)) {
-      if (regex.test(text)) {
-        return script;
-      }
-    }
-    
-    // If no special scripts are detected but there are non-Latin characters
-    if (/[^\u0000-\u007F]/.test(text)) {
-      return 'non-latin';
-    }
-    
-    return 'latin';
+  // Only allow POST method for the main endpoint
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
   }
   
-  // Helper function to check if a string is likely to contain code or SQL injection
-  containsSecurityThreat(text) {
-    if (!text || typeof text !== 'string') return false;
+  try {
+    // Get API key from request
+    const apiKey = req.headers['x-api-key'] || req.query.api_key;
     
-    const lowered = text.toLowerCase();
-    for (const pattern of this.securityPatterns) {
-      if (lowered.includes(pattern.toLowerCase())) {
-        return true;
-      }
-    }
+    // Validate API key
+    const keyValidation = clientManager.validateApiKey(apiKey);
     
-    return false;
-  }
-  
-  // Helper function to format suffix correctly
-  formatSuffix(suffix) {
-    if (!suffix) return '';
-    
-    const cleanSuffix = suffix.toLowerCase().replace(/\.$/, '').replace(/,/g, '');
-    
-    // Return the formatted version if it exists in our map
-    if (this.suffixFormatting.has(cleanSuffix)) {
-      return this.suffixFormatting.get(cleanSuffix);
-    }
-    
-    // Handle special cases for Jr and Sr that might have variations
-    if (cleanSuffix.startsWith('jr')) return 'Jr.';
-    if (cleanSuffix.startsWith('sr')) return 'Sr.';
-    
-    // Default to title case with period for other suffixes
-    return cleanSuffix.charAt(0).toUpperCase() + cleanSuffix.slice(1).toLowerCase() + '.';
-  }
-  
-  // Helper function for proper capitalization with handling for name particles
-  properCapitalize(name, isLastName = false) {
-    if (!name) return '';
-    
-    // Skip capitalization for non-Latin scripts
-    const script = this.detectScript(name);
-    if (script !== 'latin' && script !== 'unknown') {
-      return name;
-    }
-    
-    // Handle hyphenated names
-    if (name.includes('-')) {
-      return name.split('-')
-        .map(part => this.properCapitalize(part, isLastName))
-        .join('-');
-    }
-    
-    // Check for special case corrections which take precedence
-    const loweredName = name.toLowerCase();
-    if (this.specialCaseCorrections.has(loweredName)) {
-      return this.specialCaseCorrections.get(loweredName);
-    }
-    
-    // Handle special case for McSomething and MacSomething
-    if ((loweredName.startsWith('mc') || loweredName.startsWith('mac')) && name.length > 3) {
-      const prefix = name.substring(0, loweredName.startsWith('mac') ? 3 : 2);
-      const rest = name.substring(loweredName.startsWith('mac') ? 3 : 2);
-      return prefix.charAt(0).toUpperCase() + prefix.slice(1).toLowerCase() + 
-             rest.charAt(0).toUpperCase() + rest.slice(1).toLowerCase();
-    }
-    
-    // Handle O'Something names
-    if (loweredName.startsWith("o'") && name.length > 2) {
-      return "O'" + name.charAt(2).toUpperCase() + name.slice(3).toLowerCase();
-    }
-    
-    // Handle names with apostrophes in the middle (D'Artagnan)
-    if (name.includes("'") && !loweredName.startsWith("o'")) {
-      const parts = name.split("'");
-      if (parts.length >= 2) {
-        return parts[0].charAt(0).toUpperCase() + parts[0].slice(1).toLowerCase() + 
-               "'" + (parts[1].charAt(0).toUpperCase() + parts[1].slice(1).toLowerCase());
-      }
-    }
-    
-    // Handle name particles with different capitalization based on position
-    for (const particle of this.nameParticles) {
-      // If it's the entire name (rare)
-      if (loweredName === particle) {
-        return isLastName ? 
-          // Capitalize if it's a standalone last name
-          particle.charAt(0).toUpperCase() + particle.slice(1).toLowerCase() : 
-          // Keep lowercase if it's a first name or particle
-          particle.toLowerCase();
-      }
+    if (!keyValidation.valid) {
+      console.log('API REQUEST: Invalid API key', { 
+        apiKey: apiKey ? `${apiKey.substring(0, 8)}...` : 'missing',
+        reason: keyValidation.reason
+      });
       
-      // If it starts with this particle followed by a space
-      if (loweredName.startsWith(particle.toLowerCase() + ' ')) {
-        // For last names, capitalize the particle when it's at the beginning
-        // For first/middle names, or particles in the middle of names, keep lowercase
-        const particlePart = isLastName ? 
-          particle.charAt(0).toUpperCase() + particle.slice(1).toLowerCase() : 
-          particle.toLowerCase();
-        
-        const remainingPart = name.slice(particle.length + 1);
-        return `${particlePart} ${this.properCapitalize(remainingPart, isLastName)}`;
-      }
+      return res.status(401).json({ 
+        error: 'Unauthorized', 
+        reason: keyValidation.reason === 'missing_api_key' ? 'API key is required' : 'Invalid API key'
+      });
     }
     
-    // Default capitalization
-    return name.charAt(0).toUpperCase() + name.slice(1).toLowerCase();
-  }
-  
-  // Check if a name component is a name particle
-  isNameParticle(component) {
-    return this.nameParticles.has(component.toLowerCase());
-  }
-  
-  // Fix common character encoding issues
-  fixEncodingIssues(text) {
-    if (!text || typeof text !== 'string') return text;
+    // Get client details from validation result
+    const client = keyValidation.client;
     
-    return text
-      .replace(/Ã¡/g, 'á')
-      .replace(/Ã©/g, 'é')
-      .replace(/Ã­/g, 'í')
-      .replace(/Ã³/g, 'ó')
-      .replace(/Ãº/g, 'ú')
-      .replace(/Ã±/g, 'ñ')
-      .replace(/Ã¤/g, 'ä')
-      .replace(/Ã¶/g, 'ö')
-      .replace(/Ã¼/g, 'ü')
-      .replace(/Ã¨/g, 'è')
-      .replace(/Ã´/g, 'ô')
-      .replace(/Ã®/g, 'î')
-      .replace(/�/g, '');
-  }
-  
-  // Basic name format validation - fast and synchronous
-  isValidNameFormat(name) {
-    // Check if name is a string
-    if (typeof name !== 'string') {
-      return false;
+    // Check rate limit
+    const limitCheck = clientManager.checkEmailRateLimit(client.clientId);
+    
+    if (limitCheck.limited) {
+      console.log('API REQUEST: Rate limit exceeded', {
+        clientId: client.clientId,
+        clientName: client.name,
+        emailCount: limitCheck.emailCount,
+        emailLimit: limitCheck.emailLimit
+      });
+      
+      return res.status(429).json({
+        error: 'Rate limit exceeded',
+        limit: limitCheck.emailLimit,
+        used: limitCheck.emailCount,
+        remaining: limitCheck.remaining
+      });
     }
     
-    // Check if name is not empty after trimming
-    const trimmedName = name.trim();
-    if (trimmedName.length === 0) {
-      return false;
+    const { name, first_name, last_name } = req.body;
+    
+    // Check if we have either a full name or first/last components
+    if (!name && (!first_name && !last_name)) {
+      return res.status(400).json({ 
+        error: 'Either a full name or first_name/last_name components are required' 
+      });
     }
     
-    // Check for minimum length (e.g., at least 2 characters)
-    if (trimmedName.length < 2) {
-      return false;
-    }
-    
-    // Check if name contains only valid characters (letters, spaces, hyphens, apostrophes)
-    const validNameRegex = /^[\p{L}\p{M}'\-\s.]+$/u;
-    return validNameRegex.test(trimmedName);
-  }
-  
-  // Handle validation when first name and last name are provided separately
-  validateSeparateNames(firstName, lastName) {
-    console.log('NAME_VALIDATION: Processing separate first/last name components', {
-      firstName,
-      lastName
+    // Log request info with client details
+    console.log('API REQUEST: Processing name validation', { 
+      clientId: client.clientId,
+      clientName: client.name,
+      name: name || null,
+      first_name: first_name || null,
+      last_name: last_name || null,
+      timestamp: new Date().toISOString()
     });
     
-    // Handle null, undefined, etc.
-    if ((!firstName && !lastName) || (firstName === '' && lastName === '')) {
-      return {
-        originalName: '',
-        currentName: '',
-        firstName: '',
-        lastName: '',
-        middleName: '',
-        honorific: '',
-        suffix: '',
-        script: 'unknown',
-        formatValid: false,
-        status: 'invalid',
-        subStatus: 'empty_name',
-        potentialIssues: ['Null or empty name components'],
-        confidenceLevel: 'low'
-      };
-    }
-
-    // Sanitize the inputs
-    const sanitizedFirst = firstName ? String(firstName).trim().replace(/\s+/g, ' ') : '';
-    const sanitizedLast = lastName ? String(lastName).trim().replace(/\s+/g, ' ') : '';
+    // Set a global timeout to ensure we respond before Vercel's timeout
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => {
+        reject(new Error('Function timeout to prevent Vercel runtime timeout'));
+      }, 8000); // 8 seconds (just under Vercel's 10-second limit)
+    });
     
-    // Reconstruct full name for logging and reference
-    const fullName = [sanitizedFirst, sanitizedLast].filter(Boolean).join(' ');
-    
-    // Check script/language for each component
-    const firstNameScript = this.detectScript(sanitizedFirst);
-    const lastNameScript = this.detectScript(sanitizedLast);
-    
-    // Initialize result object
-    const result = {
-      originalName: fullName,
-      currentName: fullName,
-      firstName: '',
-      lastName: '',
-      middleName: '',
-      honorific: '',
-      suffix: '',
-      script: 'latin', // Default, will update based on components
-      formatValid: true,
-      status: 'valid',
-      subStatus: 'valid_format',
-      potentialIssues: [],
-      confidenceLevel: 'high',
-      isCommaFormat: false
-    };
-    
-    // Set script based on component scripts - prioritize non-Latin scripts
-    if (firstNameScript !== 'latin' && firstNameScript !== 'unknown') {
-      result.script = firstNameScript;
-    } else if (lastNameScript !== 'latin' && lastNameScript !== 'unknown') {
-      result.script = lastNameScript;
-    }
-    
-    // Process first name component
-    if (sanitizedFirst) {
-      // Check for security threats
-      if (this.containsSecurityThreat(sanitizedFirst)) {
-        result.potentialIssues.push('First name may contain code or SQL patterns');
-        result.confidenceLevel = 'low';
-        result.status = 'invalid';
-        result.subStatus = 'security_risk';
-        return result;
-      }
+    try {
+      // Log that we're starting validation
+      console.log('VALIDATION: Starting validation process', {
+        clientId: client.clientId,
+        inputType: name ? 'full_name' : 'separate_components'
+      });
       
-      // Check for suspicious test names
-      for (const fake of this.suspiciousNames) {
-        if (sanitizedFirst.toLowerCase().includes(fake.toLowerCase())) {
-          result.potentialIssues.push('First name may be a test or placeholder');
-          result.confidenceLevel = 'low';
-          break;
-        }
-      }
+      let result;
       
-      // Check for honorific in first name
-      const firstNameParts = sanitizedFirst.split(' ');
-      if (firstNameParts.length > 1) {
-        const firstComponent = firstNameParts[0].toLowerCase().replace(/\.$/, '');
-        if (this.honorifics.has(firstComponent)) {
-          result.honorific = this.properCapitalize(firstNameParts[0]);
-          result.firstName = firstNameParts.slice(1).join(' ');
-        } else {
-          // If no honorific, consider first part as first name and rest as middle name
-          result.firstName = firstNameParts[0];
-          if (firstNameParts.length > 1) {
-            result.middleName = firstNameParts.slice(1).join(' ');
-          }
-        }
+      // Handle validation differently based on input type
+      if (name) {
+        // Process full name
+        result = await Promise.race([
+          Promise.resolve(nameValidator.validateName(name)),
+          timeoutPromise
+        ]);
       } else {
-        result.firstName = sanitizedFirst;
-      }
-    }
-    
-    // Process last name component
-    if (sanitizedLast) {
-      // Check for security threats
-      if (this.containsSecurityThreat(sanitizedLast)) {
-        result.potentialIssues.push('Last name may contain code or SQL patterns');
-        result.confidenceLevel = 'low';
-        result.status = 'invalid';
-        result.subStatus = 'security_risk';
-        return result;
+        // Process separate first/last components
+        result = await Promise.race([
+          Promise.resolve(nameValidator.validateSeparateNames(first_name, last_name)),
+          timeoutPromise
+        ]);
       }
       
-      // Check for suspicious test names
-      for (const fake of this.suspiciousNames) {
-        if (sanitizedLast.toLowerCase().includes(fake.toLowerCase())) {
-          result.potentialIssues.push('Last name may be a test or placeholder');
-          result.confidenceLevel = 'low';
-          break;
-        }
-      }
+      // Increment the client's count for successful validation
+      clientManager.incrementEmailCount(client.clientId);
       
-      // Check for suffix in last name
-      const lastNameParts = sanitizedLast.split(' ');
-      if (lastNameParts.length > 1) {
-        const lastComponent = lastNameParts[lastNameParts.length - 1].toLowerCase().replace(/\.$/, '').replace(/,/g, '');
+      // Get client stats for the response
+      const clientStats = clientManager.getClientStats(client.clientId);
+      
+      // UPDATED: Handle name particles in middle name
+      let formattedFirstName, formattedLastName, formattedMiddleName;
+      
+      if (result.middleName && nameValidator.isNameParticle(result.middleName.split(' ')[0])) {
+        // For names with particles like "von", update the um_last_name to include the particle
+        // IMPORTANT: Keep the particle lowercase when it was in middle position
+        // This maintains traditional formatting (e.g., "Ludwig von Beethoven" not "Ludwig Von Beethoven")
         
-        // Check if the last component is a recognized suffix
-        if (this.suffixes.has(lastComponent) || lastComponent.startsWith('jr') || lastComponent.startsWith('sr')) {
-          // Store suffix with proper formatting
-          result.suffix = this.formatSuffix(lastComponent);
-          result.lastName = lastNameParts.slice(0, -1).join(' ');
-        } else {
-          result.lastName = sanitizedLast;
-        }
+        // Get the particle in lowercase and the capitalized last name, avoiding properCapitalize()
+        // which would incorrectly capitalize particles at the beginning of last names
+        const particle = result.middleName.toLowerCase();
+        
+        // Manually construct the combined last name keeping the particle lowercase
+        const combinedLastName = `${particle} ${result.lastName}`;
+        
+        formattedFirstName = result.honorific 
+          ? `${result.honorific} ${result.firstName}`.trim() 
+          : result.firstName;
+          
+        formattedLastName = result.suffix 
+          ? `${combinedLastName} ${result.suffix}`.trim() 
+          : combinedLastName;
+          
+        formattedMiddleName = ''; // No middle name since it's now part of the last name
       } else {
-        result.lastName = sanitizedLast;
+        // Original logic when there's no name particle
+        formattedFirstName = result.honorific 
+          ? `${result.honorific} ${result.firstName}`.trim() 
+          : result.firstName;
+          
+        formattedLastName = result.suffix 
+          ? `${result.lastName} ${result.suffix}`.trim() 
+          : result.lastName;
+          
+        formattedMiddleName = result.middleName || '';
       }
+      
+      // Determine if the name was changed during processing
+      const originalFullName = name || `${first_name || ''} ${last_name || ''}`.trim();
+      const processedFullName = `${formattedFirstName} ${formattedLastName}`.trim();
+      
+      // Compare exact case to detect capitalization changes
+      const nameWasChanged = originalFullName !== processedFullName;
+      
+      // Create a response with UM-prefixed fields, aligned with Unmessy conventions
+      const apiResponse = {
+        // Original request info
+        original_name: result.originalName,
+        input_type: name ? 'full_name' : 'separate_components',
+        
+        // UPDATED: Validation result with um_ prefix, formatted for Hubspot
+        um_first_name: formattedFirstName,
+        um_last_name: formattedLastName,
+        um_middle_name: formattedMiddleName,
+        
+        // Unmessy standard fields
+        um_name_status: nameWasChanged ? 'Changed' : 'Unchanged',
+        um_name_format: result.formatValid ? 'Valid' : 'Invalid',
+        um_name: processedFullName,  // The final formatted name
+        
+        // Original parsed components (for reference)
+        original_components: {
+          first_name: result.firstName,
+          last_name: result.lastName,
+          middle_name: result.middleName || '',
+          honorific: result.honorific || '',
+          suffix: result.suffix || ''
+        },
+        
+        // Status information (detailed validation info)
+        validation_details: {
+          status: result.status,
+          sub_status: result.subStatus,
+          format_valid: result.formatValid,
+          confidence_level: result.confidenceLevel,
+          script: result.script,
+          potential_issues: result.potentialIssues,
+          is_comma_format: result.isCommaFormat || false
+        },
+        
+        // Client usage information
+        client: {
+          id: client.clientId,
+          name: client.name,
+          processed_count: clientStats.usage.emailCount,
+          daily_limit: client.dailyEmailLimit,
+          remaining: client.dailyEmailLimit - clientStats.usage.emailCount
+        }
+      };
+      
+      // Log success and return result
+      console.log('API RESPONSE: Validation completed successfully', {
+        clientId: client.clientId,
+        inputType: name ? 'full_name' : 'separate_components',
+        um_name_status: apiResponse.um_name_status,
+        um_name_format: apiResponse.um_name_format,
+        um_first_name: apiResponse.um_first_name,
+        um_last_name: apiResponse.um_last_name
+      });
+      
+      return res.status(200).json(apiResponse);
+    } catch (error) {
+      // Log the error
+      console.error('VALIDATION ERROR: Name validation failed', {
+        clientId: client.clientId,
+        name,
+        error: error.message,
+        stack: error.stack?.split('\n')[0]
+      });
+      
+      return res.status(500).json({
+        error: 'Error validating name',
+        details: error.message
+      });
     }
+  } catch (error) {
+    // Log the fatal error
+    console.error('FATAL API ERROR:', {
+      message: error.message,
+      stack: error.stack
+    });
     
-    // Apply proper capitalization to all components
-    result.firstName = this.properCapitalize(result.firstName);
-    result.lastName = this.properCapitalize(result.lastName, true);
-    
-    if (result.middleName) {
-      result.middleName = this.properCapitalize(result.middleName);
-    }
-    
-    // If there's no valid first or last name, mark as potentially problematic
-    if (!result.firstName && !result.lastName) {
-      result.formatValid = false;
-      result.status = 'invalid';
-      result.subStatus = 'invalid_format';
-      result.potentialIssues.push('Missing both first and last name');
-      result.confidenceLevel = 'low';
-    } else if (!result.firstName) {
-      result.potentialIssues.push('Missing first name');
-      result.confidenceLevel = 'medium';
-    } else if (!result.lastName) {
-      result.potentialIssues.push('Missing last name');
-      result.confidenceLevel = 'medium';
-    }
-    
-    return result;
+    return res.status(500).json({
+      error: 'Error validating name',
+      details: error.message
+    });
+  }
+}
+
+// Health check endpoint implementation
+async function healthCheck(req, res) {
+  if (req.method !== 'GET') {
+    return res.status(405).json({ error: 'Method not allowed' });
   }
   
-  // Main validation function
-  validateName(name) {
-    console.log('NAME_VALIDATION: Starting validation for name', { name });
-    
-    // Handle null, undefined, etc.
-    if (name === null || name === undefined || name === '') {
-      return {
-        originalName: name || '',
-        currentName: '',
-        firstName: '',
-        lastName: '',
-        middleName: '',
-        honorific: '',
-        suffix: '',
-        script: 'unknown',
-        formatValid: false,
-        status: 'invalid',
-        subStatus: 'empty_name',
-        potentialIssues: ['Null or empty name'],
-        confidenceLevel: 'low'
-      };
-    }
-
-    // Ensure string type and sanitize
-    let inputStr = String(name).trim();
-    const sanitizedName = inputStr.replace(/\s+/g, ' ');
-    
-    // Check format validation
-    const formatValid = this.isValidNameFormat(sanitizedName);
-    
-    // Initialize result object
-    const result = {
-      originalName: name,
-      currentName: sanitizedName,
-      firstName: '',
-      lastName: '',
-      middleName: '',
-      honorific: '',
-      suffix: '',
-      script: this.detectScript(sanitizedName),
-      formatValid: formatValid,
-      status: formatValid ? 'valid' : 'invalid',
-      subStatus: formatValid ? 'valid_format' : 'invalid_format',
-      potentialIssues: [],
-      confidenceLevel: 'high',
-      isCommaFormat: false
-    };
-    
-    // If format is invalid, return immediately
-    if (!formatValid) {
-      result.potentialIssues.push('Invalid name format');
-      result.confidenceLevel = 'low';
-      return result;
-    }
-    
-    // Check for suspicious test names
-    let isSuspicious = false;
-    for (const fake of this.suspiciousNames) {
-      if (sanitizedName.toLowerCase().includes(fake.toLowerCase())) {
-        result.potentialIssues.push('Name may be a test or placeholder');
-        result.confidenceLevel = 'low';
-        isSuspicious = true;
-        break;
+  try {
+    // Get client statistics - redacted for health check
+    const clientStats = clientManager.listClientsStats().map(client => ({
+      clientId: client.clientId,
+      name: client.name,
+      dailyEmailLimit: client.dailyEmailLimit,
+      usage: {
+        date: client.usage.date,
+        emailCount: client.usage.emailCount,
+        remaining: client.usage.remaining
       }
-    }
+    }));
     
-    // Check for security threats
-    if (this.containsSecurityThreat(sanitizedName)) {
-      result.potentialIssues.push('Name may contain code or SQL patterns');
-      result.confidenceLevel = 'low';
-      result.status = 'invalid';
-      result.subStatus = 'security_risk';
-      return result;
-    }
-    
-    // Handle encoding issues
-    if (result.script === 'encoding-issue') {
-      result.potentialIssues.push('Character encoding issues detected');
-      result.confidenceLevel = 'medium';
-      
-      // Try to fix common encoding problems
-      const fixedName = this.fixEncodingIssues(sanitizedName);
-      
-      if (fixedName !== sanitizedName) {
-        result.currentName = fixedName;
-        result.potentialIssues.push('Attempted to fix encoding issues');
-        // Update script detection with fixed name
-        result.script = this.detectScript(fixedName);
+    // Return health status
+    return res.status(200).json({
+      status: 'ok',
+      timestamp: new Date().toISOString(),
+      version: '1.0.0',
+      environment: {
+        nodeEnv: process.env.NODE_ENV || 'not set',
+        isVercel: isVercel,
+        vercelRegion: process.env.VERCEL_REGION || 'unknown'
+      },
+      name_validation: {
+        status: 'operational',
+        honorifics: Array.from(nameValidator.honorifics).slice(0, 5),
+        suffixes: Array.from(nameValidator.suffixes).slice(0, 5),
+        specialCaseCorrections: Array.from(nameValidator.specialCaseCorrections.entries()).slice(0, 3)
+      },
+      clients: {
+        count: clientManager.clients.size,
+        stats: clientStats
       }
-    }
-    
-    // Process the name for parsing
-    let nameToProcess = result.currentName;
-    
-    // Process non-Latin names differently
-    if (result.script !== 'latin' && result.script !== 'unknown' && result.script !== 'encoding-issue') {
-      result.potentialIssues.push('Non-Latin script detected - name splitting might be approximate');
-      result.confidenceLevel = 'medium';
-      
-      // For many Asian languages that don't use spaces between words
-      if (['han', 'hiragana', 'katakana', 'thai'].includes(result.script)) {
-        if (nameToProcess.includes(' ')) {
-          // If spaces exist, treat the first part as first name, rest as last name
-          const parts = nameToProcess.split(' ');
-          result.firstName = parts[0];
-          result.lastName = parts.slice(1).join(' ');
-        } else {
-          // If no spaces, just use the whole thing as the last name
-          result.lastName = nameToProcess;
-          result.potentialIssues.push('Non-Latin name without spaces - assuming entire name is family name');
-        }
-        return result;
-      }
-    }
-    
-    // Handle comma-separated format (last name, first name)
-    if (nameToProcess.includes(',')) {
-      result.isCommaFormat = true;
-      const parts = nameToProcess.split(',').map(p => p.trim());
-      
-      // In "LastName, FirstName MiddleName" format
-      result.lastName = parts[0];
-      
-      if (parts.length > 1) {
-        const remainingParts = parts[1].split(' ').filter(Boolean);
-        if (remainingParts.length === 1) {
-          result.firstName = remainingParts[0];
-        } else if (remainingParts.length > 1) {
-          result.firstName = remainingParts[0];
-          result.middleName = remainingParts.slice(1).join(' ');
-        }
-      }
-      
-      // Apply proper capitalization
-      result.lastName = this.properCapitalize(result.lastName, true);
-      result.firstName = this.properCapitalize(result.firstName);
-      result.middleName = this.properCapitalize(result.middleName);
-      
-      return result;
-    }
-    
-    // Split the name into components
-    const components = nameToProcess.split(' ').filter(Boolean);
-    
-    // Process name components
-    let remainingComponents = [...components];
-    
-    // Check for honorific
-    if (components.length > 1) {
-      const firstComponent = components[0].toLowerCase().replace(/\.$/, '');
-      if (this.honorifics.has(firstComponent)) {
-        result.honorific = this.properCapitalize(components[0]);
-        remainingComponents.shift();
-      }
-    }
-    
-    // Check for suffix
-    if (components.length > 1) {
-      const lastComponent = components[components.length - 1].toLowerCase().replace(/\.$/, '').replace(/,/g, '');
-      if (this.suffixes.has(lastComponent)) {
-        result.suffix = this.formatSuffix(lastComponent);
-        remainingComponents.pop();
-      } else if (lastComponent.startsWith('jr') || lastComponent.startsWith('sr')) {
-        result.suffix = this.formatSuffix(lastComponent);
-        remainingComponents.pop();
-      }
-    }
-    
-    // Check if we have any components left to process
-    if (remainingComponents.length === 0) {
-      result.potentialIssues.push('Name consists of only honorifics/suffixes');
-      result.confidenceLevel = 'low';
-      return result;
-    }
-    
-    // Now process first, middle, and last names
-    if (remainingComponents.length === 1) {
-      // Only one name component remaining - treat as first name
-      result.firstName = this.properCapitalize(remainingComponents[0]);
-      result.potentialIssues.push('Only a single name was provided');
-      result.confidenceLevel = 'medium';
-    } else if (remainingComponents.length === 2) {
-      // Two components - treat as first and last name
-      result.firstName = this.properCapitalize(remainingComponents[0]);
-      result.lastName = this.properCapitalize(remainingComponents[1], true);
-    } else if (remainingComponents.length >= 3) {
-      // FIXED: Check for name particles to properly handle cases like "Ludwig von Beethoven"
-      // In many European naming conventions, particles like "von", "van", "de" are part of the last name
-      
-      // Start with assumption that first component is first name
-      result.firstName = this.properCapitalize(remainingComponents[0]);
-      
-      // Check if there's a name particle in the middle
-      const middleIndex = 1; // Index of the potential particle
-      
-      if (middleIndex < remainingComponents.length - 1 && 
-          this.isNameParticle(remainingComponents[middleIndex])) {
-        // If there's a particle, it's part of the last name
-        // E.g. "Ludwig von Beethoven" -> firstName: "Ludwig", lastName: "von Beethoven"
-        result.lastName = remainingComponents.slice(middleIndex).join(' ');
-        result.lastName = this.properCapitalize(result.lastName, true);
-      } else {
-        // Standard case: first name, middle name(s), last name
-        result.lastName = this.properCapitalize(remainingComponents[remainingComponents.length - 1], true);
-        
-        // If there are components between first and last, they're middle names
-        if (remainingComponents.length > 2) {
-          result.middleName = remainingComponents
-            .slice(1, remainingComponents.length - 1)
-            .map(name => this.properCapitalize(name))
-            .join(' ');
-        }
-      }
-    }
-    
-    return result;
-  }
-  
-  // Batch validation - process multiple names at once
-  validateBatch(names) {
-    console.log('NAME_VALIDATION: Starting batch validation', { batchSize: names.length });
-    
-    const results = [];
-    for (const name of names) {
-      results.push(this.validateName(name));
-    }
-    
-    console.log('NAME_VALIDATION: Completed batch validation', { batchSize: names.length });
-    return results;
+    });
+  } catch (error) {
+    return res.status(500).json({
+      status: 'error',
+      error: error.message
+    });
   }
 }
