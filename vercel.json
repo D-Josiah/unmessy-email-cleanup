@@ -14,7 +14,7 @@
     { "src": "/api/health", "dest": "/api/health.js" },
     { "src": "/api/webhooks/hubspot", "dest": "/api/webhooks/hubspot.js" },
     { "src": "/api/validate/email", "dest": "/api/validate/email.js" },
-    { "src": "/api/validate/batch", "dest": "/api/validate/batch.js" }
-    { "src": "/api/validate/name", "dest": "/api/validate/name.js" },
+    { "src": "/api/validate/batch", "dest": "/api/validate/batch.js" },
+    { "src": "/api/validate/name", "dest": "/api/validate/name.js" }
   ]
 }
