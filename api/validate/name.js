@@ -177,7 +177,10 @@ export default async function handler(req, res) {
       
       if (result.middleName && nameValidator.isNameParticle(result.middleName.split(' ')[0])) {
         // For names with particles like "von", update the um_last_name to include the particle
-        const updatedLastName = `${result.middleName} ${result.lastName}`;
+        // IMPORTANT: Keep the particle lowercase when it was in middle position
+        // This maintains traditional formatting (e.g., "Ludwig von Beethoven" not "Ludwig Von Beethoven")
+        const middleNameParticle = result.middleName.toLowerCase();
+        const updatedLastName = `${middleNameParticle} ${result.lastName}`;
         
         formattedFirstName = result.honorific 
           ? `${result.honorific} ${result.firstName}`.trim() 
