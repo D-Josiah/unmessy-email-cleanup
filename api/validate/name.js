@@ -184,7 +184,9 @@ export default async function handler(req, res) {
       // Determine if the name was changed during processing
       const originalFullName = name || `${first_name || ''} ${last_name || ''}`.trim();
       const processedFullName = `${formattedFirstName} ${formattedLastName}`.trim();
-      const nameWasChanged = originalFullName.toLowerCase() !== processedFullName.toLowerCase();
+      
+      // Compare exact case to detect capitalization changes
+      const nameWasChanged = originalFullName !== processedFullName;
       
       // Create a response with UM-prefixed fields, aligned with Unmessy conventions
       const apiResponse = {

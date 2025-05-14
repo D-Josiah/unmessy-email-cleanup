@@ -6,20 +6,33 @@ export class NameValidationService {
     // Detailed logging for initialization
     console.log('NAME_VALIDATOR_INIT: Initializing name validation service');
     
-    // Initialize hardcoded reference data for name validation
-    
-    // Common honorifics
+    // Common honorifics (stored lowercase for matching)
     this.honorifics = new Set([
       'mr', 'mrs', 'ms', 'miss', 'dr', 'prof', 'rev', 'hon', 'sir', 'madam', 
       'lord', 'lady', 'capt', 'major', 'col', 'lt', 'cmdr', 'sgt'
     ]);
     
-    // Common name suffixes
+    // Common name suffixes (stored lowercase for matching, but will be output with proper capitalization and periods)
     this.suffixes = new Set([
       'jr', 'sr', 'i', 'ii', 'iii', 'iv', 'v', 'phd', 'md', 'dds', 'esq'
     ]);
     
-    // Name particles that should not be capitalized conventionally
+    // Suffix formatting map (how each suffix should be displayed)
+    this.suffixFormatting = new Map([
+      ['jr', 'Jr.'],
+      ['sr', 'Sr.'],
+      ['i', 'I'],
+      ['ii', 'II'],
+      ['iii', 'III'],
+      ['iv', 'IV'],
+      ['v', 'V'],
+      ['phd', 'Ph.D.'],
+      ['md', 'M.D.'],
+      ['dds', 'D.D.S.'],
+      ['esq', 'Esq.']
+    ]);
+    
+    // Name particles that should not be capitalized conventionally in middle positions
     this.nameParticles = new Set([
       'von', 'van', 'de', 'del', 'della', 'di', 'da', 'do', 'dos', 'das', 'du', 
       'la', 'le', 'el', 'les', 'lo', 'mac', 'mc', "o'", 'al', 'bin', 'ibn', 
@@ -38,7 +51,8 @@ export class NameValidationService {
       'union', 'script', '<>'
     ]);
     
-    // Special case name corrections
+    // Special case name corrections - these take precedence over general rules
+    // The exact capitalization specified here will be preserved
     this.specialCaseCorrections = new Map([
       ['obrien', "O'Brien"],
       ['oneill', "O'Neill"],
@@ -50,7 +64,7 @@ export class NameValidationService {
       ['delafuente', 'De la Fuente']
     ]);
     
-    console.log('NAME_VALIDATOR_INIT: Reference data initialized', {
+    console.log('NAME_VALIDATOR_INIT: Reference data initialized successfully', {
       honorifics: this.honorifics.size,
       suffixes: this.suffixes.size,
       nameParticles: this.nameParticles.size,
@@ -109,7 +123,26 @@ export class NameValidationService {
     return false;
   }
   
-  // Helper function for proper capitalization with exceptions for name particles
+  // Helper function to format suffix correctly
+  formatSuffix(suffix) {
+    if (!suffix) return '';
+    
+    const cleanSuffix = suffix.toLowerCase().replace(/\.$/, '').replace(/,/g, '');
+    
+    // Return the formatted version if it exists in our map
+    if (this.suffixFormatting.has(cleanSuffix)) {
+      return this.suffixFormatting.get(cleanSuffix);
+    }
+    
+    // Handle special cases for Jr and Sr that might have variations
+    if (cleanSuffix.startsWith('jr')) return 'Jr.';
+    if (cleanSuffix.startsWith('sr')) return 'Sr.';
+    
+    // Default to title case with period for other suffixes
+    return cleanSuffix.charAt(0).toUpperCase() + cleanSuffix.slice(1).toLowerCase() + '.';
+  }
+  
+  // Helper function for proper capitalization with handling for name particles
   properCapitalize(name, isLastName = false) {
     if (!name) return '';
     
@@ -126,7 +159,7 @@ export class NameValidationService {
         .join('-');
     }
     
-    // Check for special case corrections
+    // Check for special case corrections which take precedence
     const loweredName = name.toLowerCase();
     if (this.specialCaseCorrections.has(loweredName)) {
       return this.specialCaseCorrections.get(loweredName);
@@ -154,14 +187,25 @@ export class NameValidationService {
       }
     }
     
-    // Handle name particles
+    // Handle name particles with different capitalization based on position
     for (const particle of this.nameParticles) {
+      // If it's the entire name (rare)
       if (loweredName === particle) {
-        return isLastName ? name.charAt(0).toUpperCase() + name.slice(1).toLowerCase() : name.toLowerCase();
+        return isLastName ? 
+          // Capitalize if it's a standalone last name
+          particle.charAt(0).toUpperCase() + particle.slice(1).toLowerCase() : 
+          // Keep lowercase if it's a first name or particle
+          particle.toLowerCase();
       }
       
+      // If it starts with this particle followed by a space
       if (loweredName.startsWith(particle.toLowerCase() + ' ')) {
-        const particlePart = isLastName ? particle.charAt(0).toUpperCase() + particle.slice(1).toLowerCase() : particle.toLowerCase();
+        // For last names, capitalize the particle when it's at the beginning
+        // For first/middle names, or particles in the middle of names, keep lowercase
+        const particlePart = isLastName ? 
+          particle.charAt(0).toUpperCase() + particle.slice(1).toLowerCase() : 
+          particle.toLowerCase();
+        
         const remainingPart = name.slice(particle.length + 1);
         return `${particlePart} ${this.properCapitalize(remainingPart, isLastName)}`;
       }
@@ -339,8 +383,11 @@ export class NameValidationService {
       const lastNameParts = sanitizedLast.split(' ');
       if (lastNameParts.length > 1) {
         const lastComponent = lastNameParts[lastNameParts.length - 1].toLowerCase().replace(/\.$/, '').replace(/,/g, '');
+        
+        // Check if the last component is a recognized suffix
         if (this.suffixes.has(lastComponent) || lastComponent.startsWith('jr') || lastComponent.startsWith('sr')) {
-          result.suffix = lastComponent.toUpperCase();
+          // Store suffix with proper formatting
+          result.suffix = this.formatSuffix(lastComponent);
           result.lastName = lastNameParts.slice(0, -1).join(' ');
         } else {
           result.lastName = sanitizedLast;
@@ -536,10 +583,10 @@ export class NameValidationService {
     if (components.length > 1) {
       const lastComponent = components[components.length - 1].toLowerCase().replace(/\.$/, '').replace(/,/g, '');
       if (this.suffixes.has(lastComponent)) {
-        result.suffix = lastComponent.toUpperCase();
+        result.suffix = this.formatSuffix(lastComponent);
         remainingComponents.pop();
       } else if (lastComponent.startsWith('jr') || lastComponent.startsWith('sr')) {
-        result.suffix = lastComponent.toUpperCase();
+        result.suffix = this.formatSuffix(lastComponent);
         remainingComponents.pop();
       }
     }
