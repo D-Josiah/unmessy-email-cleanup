@@ -172,14 +172,34 @@ export default async function handler(req, res) {
       // Get client stats for the response
       const clientStats = clientManager.getClientStats(client.clientId);
       
-      // Format names for Hubspot compatibility
-      const formattedFirstName = result.honorific 
-        ? `${result.honorific} ${result.firstName}`.trim() 
-        : result.firstName;
+      // UPDATED: Handle name particles in middle name
+      let formattedFirstName, formattedLastName, formattedMiddleName;
+      
+      if (result.middleName && nameValidator.isNameParticle(result.middleName.split(' ')[0])) {
+        // For names with particles like "von", update the um_last_name to include the particle
+        const updatedLastName = `${result.middleName} ${result.lastName}`;
         
-      const formattedLastName = result.suffix 
-        ? `${result.lastName} ${result.suffix}`.trim() 
-        : result.lastName;
+        formattedFirstName = result.honorific 
+          ? `${result.honorific} ${result.firstName}`.trim() 
+          : result.firstName;
+          
+        formattedLastName = result.suffix 
+          ? `${updatedLastName} ${result.suffix}`.trim() 
+          : updatedLastName;
+          
+        formattedMiddleName = ''; // No middle name since it's now part of the last name
+      } else {
+        // Original logic when there's no name particle
+        formattedFirstName = result.honorific 
+          ? `${result.honorific} ${result.firstName}`.trim() 
+          : result.firstName;
+          
+        formattedLastName = result.suffix 
+          ? `${result.lastName} ${result.suffix}`.trim() 
+          : result.lastName;
+          
+        formattedMiddleName = result.middleName || '';
+      }
       
       // Determine if the name was changed during processing
       const originalFullName = name || `${first_name || ''} ${last_name || ''}`.trim();
@@ -194,10 +214,10 @@ export default async function handler(req, res) {
         original_name: result.originalName,
         input_type: name ? 'full_name' : 'separate_components',
         
-        // Validation result with um_ prefix, formatted for Hubspot
+        // UPDATED: Validation result with um_ prefix, formatted for Hubspot
         um_first_name: formattedFirstName,
         um_last_name: formattedLastName,
-        um_middle_name: result.middleName || '',
+        um_middle_name: formattedMiddleName,
         
         // Unmessy standard fields
         um_name_status: nameWasChanged ? 'Changed' : 'Unchanged',

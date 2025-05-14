@@ -1,4 +1,4 @@
-// src/services/name-validator.js
+// src/services/name-validator.js - Updated to handle name particles properly
 export class NameValidationService {
   constructor(config) {
     this.config = config;
@@ -33,6 +33,7 @@ export class NameValidationService {
     ]);
     
     // Name particles that should not be capitalized conventionally in middle positions
+    // and should be considered part of the last name
     this.nameParticles = new Set([
       'von', 'van', 'de', 'del', 'della', 'di', 'da', 'do', 'dos', 'das', 'du', 
       'la', 'le', 'el', 'les', 'lo', 'mac', 'mc', "o'", 'al', 'bin', 'ibn', 
@@ -213,6 +214,11 @@ export class NameValidationService {
     
     // Default capitalization
     return name.charAt(0).toUpperCase() + name.slice(1).toLowerCase();
+  }
+  
+  // Check if a name component is a name particle
+  isNameParticle(component) {
+    return this.nameParticles.has(component.toLowerCase());
   }
   
   // Fix common character encoding issues
@@ -609,17 +615,33 @@ export class NameValidationService {
       result.firstName = this.properCapitalize(remainingComponents[0]);
       result.lastName = this.properCapitalize(remainingComponents[1], true);
     } else if (remainingComponents.length >= 3) {
-      // Multiple components - need more complex handling
+      // FIXED: Check for name particles to properly handle cases like "Ludwig von Beethoven"
+      // In many European naming conventions, particles like "von", "van", "de" are part of the last name
       
-      // Start with simple approach: first component is first name, last component is last name
+      // Start with assumption that first component is first name
       result.firstName = this.properCapitalize(remainingComponents[0]);
-      result.lastName = this.properCapitalize(remainingComponents[remainingComponents.length - 1], true);
       
-      // Everything in the middle is considered middle name(s)
-      result.middleName = remainingComponents
-        .slice(1, remainingComponents.length - 1)
-        .map(name => this.properCapitalize(name))
-        .join(' ');
+      // Check if there's a name particle in the middle
+      const middleIndex = 1; // Index of the potential particle
+      
+      if (middleIndex < remainingComponents.length - 1 && 
+          this.isNameParticle(remainingComponents[middleIndex])) {
+        // If there's a particle, it's part of the last name
+        // E.g. "Ludwig von Beethoven" -> firstName: "Ludwig", lastName: "von Beethoven"
+        result.lastName = remainingComponents.slice(middleIndex).join(' ');
+        result.lastName = this.properCapitalize(result.lastName, true);
+      } else {
+        // Standard case: first name, middle name(s), last name
+        result.lastName = this.properCapitalize(remainingComponents[remainingComponents.length - 1], true);
+        
+        // If there are components between first and last, they're middle names
+        if (remainingComponents.length > 2) {
+          result.middleName = remainingComponents
+            .slice(1, remainingComponents.length - 1)
+            .map(name => this.properCapitalize(name))
+            .join(' ');
+        }
+      }
     }
     
     return result;
